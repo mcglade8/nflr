@@ -1,0 +1,355 @@
+---
+title: "NFL Projections"
+output: html_document
+date: '2022-07-20'
+---
+
+```{r setup, include=FALSE}
+#install.packages("nflfastR")
+library(nflfastR)
+library(dplyr)
+library(tidyverse)
+library(TTR)
+library(coach)
+
+```
+
+
+
+### Starting Here
+```{r gather-info}
+
+pbp <- load_pbp(2022)
+
+pass_plays <- as.data.frame(pbp) %>%
+  filter(play_type == "pass")
+
+team_names <- pass_plays %>%
+  select(posteam) %>%
+  distinct()
+
+pass_plays[is.na(pass_plays)] <- 0
+
+run_plays <- as.data.frame(pbp) %>%
+  filter(play_type == "run")
+
+run_plays[is.na(run_plays)] <- 0
+
+pass_by_game_summary <- pass_plays %>%
+  group_by(game_id, posteam, defteam) %>%
+  summarise(pass_yards = sum(yards_gained), air_yards = sum(air_yards), yac = sum(yards_after_catch), late_downs_converted = sum(third_down_converted)+sum(fourth_down_converted), pass_tds = sum(pass_touchdown))
+
+run_by_game_summary <- run_plays %>%
+  group_by(game_id, posteam, defteam) %>%
+  summarise(rush_yards = sum(yards_gained), run_tds = sum(rush_touchdown))
+
+```
+
+
+### Passing EMA (offense and defense; not very predictive by itself)
+```{r pass-ema-stuff}
+ema_period <- 5
+
+
+### Offensive EMA calculations for team pass yards, air yards, and tds
+temp_df <- pass_by_game_summary %>%
+  filter(posteam == team_names$posteam[1])
+
+off_pass_yards_ema <- EMA(temp_df$pass_yards, ema_period)
+off_pass_yards_ema <- off_pass_yards_ema[-length(off_pass_yards_ema)]
+
+off_pass_tds_ema <- EMA(temp_df$pass_tds, ema_period)
+off_pass_tds_ema <- off_pass_tds_ema[-length(off_pass_tds_ema)]
+
+off_pass_ays_ema <- EMA(temp_df$air_yards, ema_period)
+off_pass_ays_ema <- off_pass_ays_ema[-length(off_pass_ays_ema)]
+
+temp_df = temp_df[-1,]
+temp_df$opy_ema <- off_pass_yards_ema
+temp_df$optd_ema <- off_pass_tds_ema
+temp_df$opair_ema <- off_pass_ays_ema
+
+team_pass_offense_trends <- temp_df
+
+for(i in 2:length(team_names$posteam)){
+  temp_df <- pass_by_game_summary %>%
+  filter(posteam == team_names$posteam[i])
+
+off_pass_yards_ema <- EMA(temp_df$pass_yards, ema_period)
+off_pass_yards_ema <- off_pass_yards_ema[-length(off_pass_yards_ema)]
+
+off_pass_tds_ema <- EMA(temp_df$pass_tds, ema_period)
+off_pass_tds_ema <- off_pass_tds_ema[-length(off_pass_tds_ema)]
+
+off_pass_ays_ema <- EMA(temp_df$air_yards, ema_period)
+off_pass_ays_ema <- off_pass_ays_ema[-length(off_pass_ays_ema)]
+
+temp_df = temp_df[-1,]
+temp_df$opy_ema <- off_pass_yards_ema
+temp_df$optd_ema <- off_pass_tds_ema
+temp_df$opair_ema <- off_pass_ays_ema
+  
+team_pass_offense_trends <- rbind(team_offense_trends, temp_df)
+
+}
+
+
+### Defensive EMA calculations for team pass yards, air yards, and tds
+temp_df <- pass_by_game_summary %>%
+  filter(defteam == team_names$posteam[1])
+
+off_pass_yards_ema <- EMA(temp_df$pass_yards, ema_period)
+off_pass_yards_ema <- off_pass_yards_ema[-length(off_pass_yards_ema)]
+
+off_pass_tds_ema <- EMA(temp_df$pass_tds, ema_period)
+off_pass_tds_ema <- off_pass_tds_ema[-length(off_pass_tds_ema)]
+
+off_pass_ays_ema <- EMA(temp_df$air_yards, ema_period)
+off_pass_ays_ema <- off_pass_ays_ema[-length(off_pass_ays_ema)]
+
+temp_df = temp_df[-1,]
+temp_df$opy_ema <- off_pass_yards_ema
+temp_df$optd_ema <- off_pass_tds_ema
+temp_df$opair_ema <- off_pass_ays_ema
+
+team_pass_defense_trends <- temp_df
+
+for(i in 2:length(team_names$posteam)){
+  temp_df <- pass_by_game_summary %>%
+  filter(defteam == team_names$posteam[i])
+
+off_pass_yards_ema <- EMA(temp_df$pass_yards, ema_period)
+off_pass_yards_ema <- off_pass_yards_ema[-length(off_pass_yards_ema)]
+
+off_pass_tds_ema <- EMA(temp_df$pass_tds, ema_period)
+off_pass_tds_ema <- off_pass_tds_ema[-length(off_pass_tds_ema)]
+
+off_pass_ays_ema <- EMA(temp_df$air_yards, ema_period)
+off_pass_ays_ema <- off_pass_ays_ema[-length(off_pass_ays_ema)]
+
+temp_df = temp_df[-1,]
+temp_df$opy_ema <- off_pass_yards_ema
+temp_df$optd_ema <- off_pass_tds_ema
+temp_df$opair_ema <- off_pass_ays_ema
+  
+team_pass_defense_trends <- rbind(team_offense_trends, temp_df)
+
+}
+
+team_pass_defense_trends <- team_pass_defense_trends %>%
+  rename(dpy_ema = opy_ema, dptd_ema = optd_ema, dpair_ema = opair_ema)
+
+temp_df <- team_pass_defense_trends %>%
+  select(game_id, dpy_ema, dptd_ema, dpair_ema)
+
+team_pass_trends <- team_pass_offense_trends %>%
+  merge(temp_df, by = "game_id")
+
+team_pass_trends <- na.omit(team_pass_trends)
+
+team_pass_trends <- team_pass_trends[team_pass_trends$posteam.x != team_pass_trends$posteam.y,]
+
+team_pass_trends$qb_dkfps <- team_pass_trends$pass_yards*0.04+team_pass_trends$pass_tds*4
+
+lm_ema_based_qb_points <- lm(qb_dkfps ~ opy_ema + optd_ema+ opair_ema+ dpy_ema+ dptd_ema+dpair_ema, data = team_pass_trends)
+summary(lm_ema_based_qb_points)
+
+
+```
+
+
+### Working with roster and position data
+```{r roster}
+rm(roster)
+#roster <- fast_scraper_roster(seasons = 2022) # This isn't working right now so making it myself below
+pbp <- load_pbp(2022) 
+
+qb_roster <- pbp %>%
+  select(posteam, passer_player_id, passer_player_name) %>%
+  rename(gsis_id = passer_player_id, full_name =  passer_player_name, team = posteam) %>%
+  mutate(position = "QB") %>%
+  distinct()
+qb_roster <- qb_roster[complete.cases(qb_roster),]
+
+rec_roster <- pbp %>%
+  select(posteam, receiver_player_id, receiver_player_name)%>%
+  rename(gsis_id = receiver_player_id, full_name =  receiver_player_name, team = posteam) %>%
+  mutate(position = "REC") %>%
+  distinct()
+rec_roster <- rec_roster[complete.cases(rec_roster),]
+
+run_roster <- pbp %>%
+  select(posteam, rusher_player_id, rusher_player_name)%>%
+  rename(gsis_id = rusher_player_id, full_name =  rusher_player_name, team = posteam) %>%
+  mutate(position = "RB") %>%
+  distinct()
+run_roster <- run_roster[complete.cases(run_roster),]
+
+roster <- rbind(qb_roster, rec_roster, run_roster)
+
+pbp <- pbp %>%
+  mutate(
+    pass_fps = passing_yards*.04+pass_touchdown*4-interception,
+    rush_fps = rushing_yards*.1+rush_touchdown*6-fumble_lost,
+    rec_fps = receiving_yards*.1+pass_touchdown*6-fumble_lost
+  )
+
+pbp$pass_fps[is.na(pbp$pass_fps)] <- 0
+pbp$rush_fps[is.na(pbp$rush_fps)] <- 0
+pbp$rec_fps[is.na(pbp$rec_fps)] <- 0
+
+passing_info <- pbp %>%
+  filter(!is.na(receiver_id))%>%
+  select(passer, passer_id, receiver, receiver_id, epa, pass_fps, rec_fps, defteam)
+
+qb_fps_provided <- passing_info %>%
+  group_by(passer_id, passer) %>%
+  summarise(mean_epa = mean(epa), mean_pass_fps = mean(pass_fps), attempts = n())
+
+rec_fps_provided <-passing_info %>%
+  group_by(receiver_id, receiver) %>%
+  summarise(mean_epa = mean(epa), mean_rec_fps = mean(rec_fps), receptions = n())
+
+defense_pass_fps_allowed <-passing_info %>%
+  group_by(defteam) %>%
+  summarise(mean_pass_epa = mean(epa), mean_pass_fps = mean(pass_fps), mean_rec_fps = mean(rec_fps))
+
+rushing_info <- pbp %>%
+  filter(!is.na(rusher_id)) %>%
+  select(rusher, rusher_id, epa, rush_fps, defteam)
+
+rush_fps_provided <- rushing_info %>%
+  group_by(rusher_id, rusher) %>%
+  summarise(mean_epa = mean(epa), mean_rush_fps = mean(rush_fps), rush_attempts = n())
+
+defense_rush_fps_allowed <- rushing_info %>%
+  group_by(defteam) %>%
+  summarise(mean_rush_epa = mean(epa), mean_rush_fps = mean(rush_fps))
+
+defense_fps_allowed <- defense_pass_fps_allowed%>%
+  merge(defense_rush_fps_allowed, by = "defteam")
+
+offense_pace_of_play <- pbp %>%
+  filter(!is.na(passer_id)) %>%
+  group_by(game_id, posteam) %>%
+  summarise(pass_plays = n()) %>%
+  group_by(posteam) %>%
+  summarise(mean_pass_plays = mean(pass_plays))
+
+rush_pace_of_play <- pbp %>%
+  filter(!is.na(rusher_id)) %>%
+  group_by(game_id, posteam) %>%
+  summarise(rush_plays = n()) %>%
+  group_by(posteam) %>%
+  summarise(mean_rush_plays = mean(rush_plays))
+
+offense_pace_of_play <- offense_pace_of_play %>%
+  merge(rush_pace_of_play, by = "posteam")
+
+defense_pace_of_play <- pbp %>%
+  filter(!is.na(passer_id)) %>%
+  group_by(game_id, defteam) %>%
+  summarise(pass_plays = n()) %>%
+  group_by(defteam) %>%
+  summarise(mean_pass_plays = mean(pass_plays))
+
+rush_fps_provided <- rush_fps_provided %>%
+  rename(gsis_id = rusher_id, rush_mean_epa = mean_epa)
+rec_fps_provided <- rec_fps_provided %>%
+  rename(gsis_id = receiver_id, rec_mean_epa = mean_epa)
+qb_fps_provided <- qb_fps_provided %>%
+  rename(gsis_id = passer_id, pass_mean_epa = mean_epa, pass_attempts = attempts)
+
+
+rush_pace_of_play <- pbp %>%
+  filter(!is.na(rusher_id)) %>%
+  group_by(game_id, defteam) %>%
+  summarise(rush_plays = n()) %>%
+  group_by(defteam) %>%
+  summarise(mean_rush_plays = mean(rush_plays))
+
+defense_pace_of_play <- defense_pace_of_play %>%
+  merge(rush_pace_of_play, by = "defteam")
+
+offense_pace_of_play <- rename(offense_pace_of_play, team = posteam)
+
+player_fps <- roster %>%
+  merge(rec_fps_provided, by = "gsis_id", all.x = TRUE) %>%
+  merge(rush_fps_provided, by = "gsis_id", all.x = TRUE) %>%
+  merge(qb_fps_provided, by = "gsis_id", all.x = TRUE)
+
+player_fps[is.na(player_fps)] <-0
+
+player_fps <- player_fps %>%
+  merge(offense_pace_of_play, by = "team") %>%
+  mutate(
+    passing_prio = pass_attempts / mean_pass_plays,
+    receiving_prio = receptions / mean_pass_plays,
+    rushing_prio = rush_attempts / mean_rush_plays,
+    rel_pass_epa = pass_mean_epa * passing_prio,
+    rel_rec_epa = rec_mean_epa * receiving_prio,
+    rel_rush_epa = rush_mean_epa * rushing_prio,
+    rel_pass_fps = mean_pass_fps * passing_prio,
+    rel_rec_fps = mean_rec_fps * receiving_prio,
+    rel_rush_fps = mean_rush_fps * rushing_prio,
+    pass_fps = mean_pass_fps * pass_attempts,
+    rec_fps = mean_rec_fps * receptions,
+    rush_fps = mean_rush_fps * rush_attempts
+  ) %>%
+  distinct()
+
+player_fps <- player_fps %>%
+  merge(player_positions, by = "gsis_id") %>%
+  rename(position = position.x)
+  
+qbs <- player_fps %>%
+  filter(position == "QB") %>%
+  select(-rec_mean_epa, -receptions, -mean_rec_fps, -receiving_prio, -rel_rec_epa, -rel_rec_fps, -rec_fps)
+
+recs <- player_fps %>%
+  filter(position == "REC") %>%
+  select(-pass_mean_epa, -pass_attempts, -mean_pass_fps, -passing_prio, -rel_pass_epa, -rel_pass_fps, -pass_fps)
+
+rbs <- player_fps %>%
+  filter(position == "RB") %>%
+  select(-pass_mean_epa, -pass_attempts, -mean_pass_fps, -passing_prio, -rel_pass_epa, -rel_pass_fps, -pass_fps)
+
+
+lm_passing_fps <- lm(pass_fps ~ passing_prio + rel_pass_epa, data = qbs) ### Adjusted R2 0.9385
+lm_qb_rushing <- lm(rush_fps ~ rushing_prio + rel_rush_epa, data = qbs) ### Adjusted R2 0.823
+lm_rb_rushing <- lm(rush_fps ~ rushing_prio + rel_rush_epa, data = rbs) ### Adjusted R2 0.9311
+lm_rb_receiving <- lm(rec_fps ~ receiving_prio + rel_rec_epa, data = rbs) ### Adjusted R2 0.887
+lm_rec_receiving <- lm(rec_fps ~ receiving_prio + rel_rec_epa, data = recs) ### Adjusted R2 0.9352
+
+summary(lm_rec_receiving)
+
+qb_export <- qbs %>%
+  select(full_name, team, passing_prio, rel_pass_epa, rushing_prio, rel_rush_epa, pass_attempts) %>%
+  mutate(pass_projection = predict(lm_passing_fps), run_projection = predict(lm_qb_rushing), expected_fps = pass_projection + run_projection) %>%
+  filter(pass_attempts >= 15) %>%
+  select(full_name, team, expected_fps)
+rec_export <- recs %>%
+  select(full_name, team, receiving_prio, rel_rec_epa, receptions) %>%
+  mutate(expected_fps = predict(lm_rec_receiving)) %>%
+  filter(receptions >= 5) %>%
+  select(full_name, team, expected_fps)
+rb_export <- rbs %>%
+  select(full_name, team, rushing_prio, rel_rush_epa, receiving_prio, rel_rec_epa, rush_attempts) %>%
+  mutate(run_projection = predict(lm_rb_rushing), rec_projection = predict(lm_rb_receiving), expected_fps = run_projection + rec_projection) %>%
+    filter(rush_attempts >= 10) %>%
+  select(full_name, team, expected_fps)
+def_export <- defense_rush_fps_allowed %>%
+  merge(defense_pass_fps_allowed, by = "defteam")
+
+
+write.csv(qb_export, "C:/Users/jorda/OneDrive//qb_export.csv", row.names = FALSE)
+write.csv(rb_export, "C:/Users/jorda/OneDrive//rb_export.csv", row.names = FALSE)
+write.csv(rec_export, "C:/Users/jorda/OneDrive//rec_export.csv", row.names = FALSE)
+write.csv(def_export, "C:/Users/jorda/OneDrive//def_export.csv", row.names = FALSE)
+
+
+write.csv(offense_pace_of_play, "C:/Users/jorda/OneDrive//offense_pace_of_play.csv", row.names = FALSE)
+write.csv(defense_pace_of_play, "C:/Users/jorda/OneDrive//defense_pace_of_play.csv", row.names = FALSE)
+
+
+```
