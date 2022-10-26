@@ -353,3 +353,306 @@ write.csv(defense_pace_of_play, "C:/Users/jorda/OneDrive//defense_pace_of_play.c
 
 
 ```
+
+
+### SD team
+```{r standard-deviations}
+
+run_sd <- run_by_game_summary %>%
+  group_by(posteam) %>%
+  summarise(sd_fps = sd(rush_yards)*.1+sd(run_tds)*6)
+
+pass_sd <- pass_by_game_summary %>%
+  group_by(posteam) %>%
+  summarise(sd_fps = sd(pass_yards)*.04+sd(pass_tds)*6)
+
+
+write.csv(run_sd, "C:/Users/jorda/OneDrive//run_sd.csv", row.names = FALSE)
+write.csv(pass_sd, "C:/Users/jorda/OneDrive//pass_sd.csv", row.names = FALSE)
+
+```
+
+### Coach lineup builder
+```{r lineup-builder}
+### ~~~ Parameters ~~~ ###
+
+set.seed(NULL)              # Seed is NULL so as not to create the same lineups every time
+teams_to_stack <- c("GB")  # Use one team at a time to ensure QB is stacked with teammates
+stack_sizes <- 3 #3           # Number of players in stack
+num_lineups <- 10 #23           # Number of lineups to create #20 ARI; 10 TB, 20 BUF, 10 CLE, 9 BAL
+bans <- c("Drew Sample")
+
+
+### SlateProjections exported from NFL Matchups sheet PP Upside; import upside finder from PlayerProfiler (check cell A1 comment)
+
+SlateProjections <- SlateProjections %>%
+  select(player_id, Projected.Points, SD)
+
+### Be sure to have downloaded salaries from DK to the below file location
+
+data <- read_dk("C:/Users/jorda/Downloads/DKSalaries.csv") 
+
+bans <- data %>%
+  filter(player %in% bans) %>%
+  select(row_id)
+
+
+### Treating DST and QB data differently so they are addressed correctly for the purpose of stacking
+
+dst_data <- data %>%
+  filter(position == "DST")
+
+### If you choose to stack, will set stacked team's and opponent's DSTs to -15 projected fps so they are not included in the lineup; not optimal since team DST could still score well in a blowout but this way the DST is not considered part of the stack with the QB and you are not playing a DST against your stack
+
+if(!is.null(teams_to_stack)){
+stacked_dst <- dst_data %>%
+ filter(team %in% teams_to_stack | opp_team %in% teams_to_stack) %>%
+  mutate(fpts_proj = -1000, SD = 0)
+
+unstacked_dst <- dst_data %>%
+  filter(!team %in% teams_to_stack & !opp_team %in% teams_to_stack)%>%
+  mutate(fpts_proj = .001*salary + .3*fpts_avg, SD = 2)
+
+dst_data <- rbind(stacked_dst, unstacked_dst)
+}else{
+    dst_data <-dst_data %>%
+      mutate(fpts_proj = .001*salary + .3*fpts_avg, SD = 2)
+}
+
+qb_data <- data %>%
+  filter(position == "QB") 
+
+qb_data <-qb_data %>%
+  merge(SlateProjections, by = "player_id") 
+
+qb_data <-qb_data %>%
+  select(-fpts_proj) %>%
+  rename(fpts_proj = Projected.Points)
+
+qb_data[is.na(qb_data)] <- 0
+
+if(!is.null(teams_to_stack)){
+stacked_qbs <- qb_data %>%
+  filter(team %in% teams_to_stack)
+
+### Assigning arbitrarily large fpts_proj and 0 SD to highest projected QB so that starter is in every lineup (i.e. so that if randomness were to set projection below 0 we don't start a backup); opposite for every other QB
+
+stacked_qbs <- stacked_qbs[order(stacked_qbs$fpts_proj),]
+stacked_qbs$fpts_proj[length(stacked_qbs$fpts_proj)] = 1000  
+stacked_qbs$SD[length(stacked_qbs$SD)] = 0  
+
+non_stacked_qbs <- qb_data %>%
+  filter(!team %in% teams_to_stack) %>%
+  mutate(fpts_proj = -1000, SD = 0)
+
+qb_data <- rbind(stacked_qbs, non_stacked_qbs)
+}
+
+data <- data %>%
+  filter(position != "DST" & position != "QB") %>%
+  merge(SlateProjections, by = "player_id", all.x = TRUE) %>%
+  select(-fpts_proj) %>%
+  rename(fpts_proj = Projected.Points)
+  
+data <- data %>%
+  rbind(dst_data) %>%
+  rbind(qb_data)
+
+data[is.na(data)] <- 0
+data <- data[order(data$row_id),]
+
+model <- model_dk_nfl(data)
+
+n <- nrow(data) 
+randomness <- function(x) rnorm(n, mean = data$fpts_proj, sd = data$SD)
+
+rm(results)
+results <- optimize_generic(data, model, L = num_lineups, randomness = randomness, stack_sizes = stack_sizes, stack_teams = teams_to_stack, bans = bans$row_id)
+write_lineups(results, "C:/Users/jorda/OneDrive//mylineups.csv", site = "draftkings", sport = "nfl")
+
+```
+
+
+### sim SD Optimal
+```{r sim-showdown}
+SDOptimal <- SDOptimal %>%
+  mutate(proj = as.numeric(Projected.Pts), sd = as.numeric(SD))%>%
+  filter(Projected.Pts != "#N/A") %>%
+  select(Name, Salary, proj, sd, GPP.Need, FLEX.own, CPT.own)
+
+SDOptimal$FLEX.own <- gsub("%", "", as.character(SDOptimal$FLEX.own))
+SDOptimal$CPT.own <- gsub("%", "", as.character(SDOptimal$CPT.own))
+
+ownership <- SDOptimal %>%
+  select(Name, FLEX.own, CPT.own) %>%
+  rename(flex = FLEX.own, cpt = CPT.own) %>%
+  mutate(flex = as.numeric(flex), cpt = as.numeric(cpt))
+
+sim_length = 100000
+#rm(team_bats_simulation)
+showdown_simulation <- rnorm(sim_length, mean = SDOptimal$proj[1], sd = SDOptimal$sd[1])
+for(i in 2:length(SDOptimal$proj)){
+temp_vector <- rnorm(sim_length, mean = SDOptimal$proj[i], sd = SDOptimal$sd[i])
+showdown_simulation <- cbind(showdown_simulation, temp_vector)
+}
+
+name_vector <- SDOptimal$Name
+colnames(showdown_simulation) <- name_vector
+
+sim_rank <- t(apply(-showdown_simulation, 1, rank))
+sim_rank <- t(sim_rank)
+
+ones_vector <- vector("numeric", length(name_vector))
+twos_vector <- vector("numeric", length(name_vector))
+threes_vector <- vector("numeric", length(name_vector))
+fours_vector <- vector("numeric", length(name_vector))
+fives_vector <- vector("numeric", length(name_vector))
+sixes_vector <- vector("numeric", length(name_vector))
+
+for(i in 1:length(sim_rank)){
+  
+if(i %% length(name_vector) == 0){
+  if(sim_rank[i] == 1){
+    ones_vector[length(name_vector) ] <- ones_vector[ length(name_vector)] + 1
+  }
+  if(sim_rank[i] == 2){
+    twos_vector[length(name_vector) ] <- twos_vector[length(name_vector)] + 1
+  }
+  if(sim_rank[i] == 3){
+    threes_vector[length(name_vector) ] <- threes_vector[length(name_vector)] + 1
+  }
+    if(sim_rank[i] == 4){
+    fours_vector[length(name_vector) ] <- fours_vector[length(name_vector)] + 1
+    }
+    if(sim_rank[i] == 5){
+    fives_vector[length(name_vector) ] <- fives_vector[length(name_vector)] + 1
+    }
+    if(sim_rank[i] == 6){
+    sixes_vector[length(name_vector) ] <- sixes_vector[length(name_vector)] + 1
+  }
+}
+else{
+  if(sim_rank[i] == 1){
+    ones_vector[i %% length(name_vector) ] <- ones_vector[i %% length(name_vector)] + 1
+  }
+  if(sim_rank[i] == 2){
+    twos_vector[i %% length(name_vector) ] <- twos_vector[i %% length(name_vector)] + 1
+  }
+  if(sim_rank[i] == 3){
+    threes_vector[i %% length(name_vector) ] <- threes_vector[i %% length(name_vector)] + 1
+  }
+    if(sim_rank[i] ==4){
+    fours_vector[i %% length(name_vector) ] <- fours_vector[i %% length(name_vector)] + 1
+    }
+    if(sim_rank[i] == 5){
+    fives_vector[i %% length(name_vector) ] <- fives_vector[i %% length(name_vector)] + 1
+    }
+    if(sim_rank[i] == 6){
+    sixes_vector[i %% length(name_vector) ] <- sixes_vector[i %% length(name_vector)] + 1
+  }
+}
+}
+sim_rank <- t(sim_rank)
+sr_summary <-  t(data.frame(ones_vector,twos_vector,threes_vector, fours_vector, fives_vector, sixes_vector))
+colnames(sr_summary) <- name_vector
+sr_summary <- t(sr_summary)
+sr_summary <- as.data.frame(sr_summary)
+sr_summary <- sr_summary%>%
+  mutate(top_scorer = ones_vector/sim_length*100, top_six = (ones_vector+twos_vector+threes_vector+fours_vector+fives_vector+sixes_vector)/(sim_length)*100) %>%
+  select(top_scorer, top_six)
+
+
+
+### Value sim
+
+SDOptimalValue <- SDOptimal %>%
+  mutate(proj=proj/GPP.Need, sd=sd/GPP.Need)
+
+showdown_value_simulation <- rnorm(sim_length, mean = SDOptimalValue$proj[1], sd = SDOptimalValue$sd[1])
+for(i in 2:length(SDOptimal$proj)){
+temp_vector <- rnorm(sim_length, mean = SDOptimalValue$proj[i], sd = SDOptimalValue$sd[i])
+showdown_value_simulation <- cbind(showdown_value_simulation, temp_vector)
+}
+
+name_vector <- SDOptimalValue$Name
+colnames(showdown_value_simulation) <- name_vector
+
+value_sim_rank <- t(apply(-showdown_value_simulation, 1, rank))
+value_sim_rank <- t(value_sim_rank)
+
+ones_vector <- vector("numeric", length(name_vector))
+twos_vector <- vector("numeric", length(name_vector))
+threes_vector <- vector("numeric", length(name_vector))
+fours_vector <- vector("numeric", length(name_vector))
+fives_vector <- vector("numeric", length(name_vector))
+sixes_vector <- vector("numeric", length(name_vector))
+
+for(i in 1:length(value_sim_rank)){
+  
+if(i %% length(name_vector) == 0){
+  if(value_sim_rank[i] == 1){
+    ones_vector[length(name_vector) ] <- ones_vector[ length(name_vector)] + 1
+  }
+  if(value_sim_rank[i] == 2){
+    twos_vector[length(name_vector) ] <- twos_vector[length(name_vector)] + 1
+  }
+  if(value_sim_rank[i] == 3){
+    threes_vector[length(name_vector) ] <- threes_vector[length(name_vector)] + 1
+  }
+    if(value_sim_rank[i] == 4){
+    fours_vector[length(name_vector) ] <- fours_vector[length(name_vector)] + 1
+    }
+    if(value_sim_rank[i] == 5){
+    fives_vector[length(name_vector) ] <- fives_vector[length(name_vector)] + 1
+    }
+    if(value_sim_rank[i] == 6){
+    sixes_vector[length(name_vector) ] <- sixes_vector[length(name_vector)] + 1
+  }
+}
+else{
+  if(value_sim_rank[i] == 1){
+    ones_vector[i %% length(name_vector) ] <- ones_vector[i %% length(name_vector)] + 1
+  }
+  if(value_sim_rank[i] == 2){
+    twos_vector[i %% length(name_vector) ] <- twos_vector[i %% length(name_vector)] + 1
+  }
+  if(value_sim_rank[i] == 3){
+    threes_vector[i %% length(name_vector) ] <- threes_vector[i %% length(name_vector)] + 1
+  }
+    if(value_sim_rank[i] ==4){
+    fours_vector[i %% length(name_vector) ] <- fours_vector[i %% length(name_vector)] + 1
+    }
+    if(value_sim_rank[i] == 5){
+    fives_vector[i %% length(name_vector) ] <- fives_vector[i %% length(name_vector)] + 1
+    }
+    if(value_sim_rank[i] == 6){
+    sixes_vector[i %% length(name_vector) ] <- sixes_vector[i %% length(name_vector)] + 1
+  }
+}
+}
+value_sim_rank <- t(value_sim_rank)
+vsr_summary <-  t(data.frame(ones_vector,twos_vector,threes_vector, fours_vector, fives_vector, sixes_vector))
+colnames(vsr_summary) <- name_vector
+vsr_summary <- t(vsr_summary)
+vsr_summary <- as.data.frame(vsr_summary)
+vsr_summary <- vsr_summary%>%
+  mutate(top_value = ones_vector/sim_length*100, top_six_value = (ones_vector+twos_vector+threes_vector+fours_vector+fives_vector+sixes_vector)/(sim_length)*100) %>%
+  select(top_value, top_six_value)
+
+vsr_summary$Name <- rownames(vsr_summary)
+sr_summary$Name <- rownames(sr_summary)
+
+
+sr_summary <- merge(sr_summary, vsr_summary, by = "Name")
+
+sr_summary <- merge(sr_summary, ownership, by = "Name")
+
+sr_summary <- sr_summary %>%
+  mutate(
+    cpt_leverage_score = top_scorer*(100-cpt)/100,
+    flex_leverage_score = top_six*(100-flex)/100,
+    cpt_leverage_value = top_value*(100-cpt)/100,
+    flex_leverage_value = top_six_value*(100-flex)/100
+  )
+
+```
