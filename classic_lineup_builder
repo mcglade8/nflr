@@ -1,0 +1,141 @@
+
+
+### Classic Lineup Builder LPSolve
+```{r classic-solver}
+
+numlineups <- 10
+teams_to_stack <-NULL
+stack_size <- 3
+testing <- T
+locks <- NULL
+bans <- NULL
+
+
+if(!testing){
+odata <- read_sheet("https://docs.google.com/spreadsheets/d/1CjCVMPLzgX1JONYas7GbXyV9ZEwWXPmDfH6pAgm-ZA8/edit#gid=537166457")
+ 
+  odata <- odata %>%
+   filter(!is.na(Name))
+
+}
+
+teams <- data$TeamAbbrev %>%
+  unique()
+
+times_stacked <- data.frame(team = teams, times_stacked = 0)
+t <- 0
+while(t < numlineups){
+  data <- odata
+  
+  #find stack
+  
+  stack_proj <- data %>%
+    group_by(TeamAbbrev) %>%
+    slice_max(order_by = DK.FPs, n = 3) %>%
+    summarise(sum_stack_fpts = sum(DK.FPs))
+  stack_qb_own <- data %>%
+    filter(Position == "QB") %>%
+    group_by(TeamAbbrev) %>% 
+    slice_max(order_by = OwnProj, n = 1) %>%
+    summarise(stack_qb_own = sum(OwnProj))
+  stack_own <- data %>%
+    group_by(TeamAbbrev) %>% 
+    slice_max(order_by = OwnProj, n = 3) %>%
+    summarise(stack_own = sum(OwnProj))
+  stacks <- merge(stack_proj, stack_qb_own) %>%
+    merge(stack_own)
+  stacks[2:4] <- as.data.frame(scale(stacks[2:4]))
+  
+  stacks$stack_appeal <- stacks$sum_stack_fpts + stacks$stack_qb_own*.33 + stacks$stack_own*.67
+  stacks$select <- rnorm(length(stacks$stack_appeal), stacks$stack_appeal, 1)
+  
+  picker_min <- min(stacks$select)
+  picker_max <- max(stacks$select)
+  pick <- runif(1, picker_min, picker_max)
+  
+  team_to_stack <- filter(stacks, select > pick)
+  team_to_stack <- team_to_stack$TeamAbbrev[which.min(team_to_stack$select)]
+  
+  stack_qb <- data %>%
+    filter(DK.FPs > 0, Position == "QB", TeamAbbrev == team_to_stack)
+  stack_rec <- data %>%
+    filter(Position == "WR" | Position == "TE", TeamAbbrev == team_to_stack)
+  stack_rec_sd <- stack_rec %>%
+    select(Position, DK.FPs) %>%
+    mutate(sd = case_when(Position == "WR" ~ 2+.6 * DK.FPs, Position == "TE" ~ 1+.5*DK.FPs))
+  top_rec_pick <- rnorm(length(stack_rec$DK.FPs), stack_rec$DK.FPs, stack_rec_sd$sd)
+  
+  stack_rec <- stack_rec[which.max(top_rec_pick),]
+  
+  times_stacked <- mutate(times_stacked, times_stacked = case_when(team == team_to_stack ~ times_stacked + 1, T ~ times_stacked))
+
+  build_sd <- data %>%
+    select(Position, DK.FPs) %>%
+    mutate(sd = case_when(Position == "QB" ~ .3 * DK.FPs, Position == "RB" ~ 1+.55 * DK.FPs, Position == "WR" ~ .6 * DK.FPs, Position == "TE" ~ .35*DK.FPs, Position == "DST" ~ .4*DK.FPs))
+  
+  
+  ### Build optimizer
+  
+  objective.in <- rnorm(length(data$DK.FPs), mean = data$DK.FPs, sd = build_sd$sd)
+  
+  vsalary <- data$`DK Salary`
+  vstack_util <- as.numeric(data$TeamAbbrev == team_to_stack & !data$Position == "DST")
+  vlocks <- as.numeric(data$Name %in% stack_qb$Name | data$Name %in% stack_rec$Name | data$Name %in% locks)
+  vbans <- as.numeric((data$Opp %in% stack_qb$TeamAbbrev & data$Position == "DST") | data$Name %in% bans)
+  vqb <- as.numeric(data$Position == "QB")
+  vwr <- as.numeric(data$Position == "WR")
+  vrb <- as.numeric(data$Position == "RB")
+  vte <- as.numeric(data$Position == "TE")
+  vdst <- as.numeric(data$Position == "DST")
+  vplaying <- as.numeric(data$DK.FPs > 0)
+  vout  <- as.numeric(data$DK.FPs <= 0)
+
+  
+  matrix_vector <- c(vsalary, vstack_util, vlocks, vbans, vqb, vwr, vrb, vte, vdst, vplaying, vout)
+  
+  const.mat = matrix(matrix_vector, nrow = length(matrix_vector)/length(data$`DK Salary`), byrow=TRUE)
+  const.dir = c("<=", ">=", "==", "==","==", ">=", ">=", ">=", "==", "==", "==")
+  const.rhs = c(50000, stack_size, sum(vlocks), 0, 1, 3, 2, 1, 1, 9, 0)
+  
+  optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
+
+  data$optimal <- optimum$solution
+  
+  lineup <- data %>%
+    filter(optimal == 1)
+
+  qb <- filter(lineup, Position == "QB")
+  rb <- filter(lineup, Position == "RB")
+  wr <- filter(lineup, Position == "WR")
+  te <- filter(lineup, Position == "TE")
+  dst <- filter(lineup, Position == "DST")
+  
+  if(length(rb$Name) > 2){
+    flex <- rb[3,]
+    rb <- filter(rb, ! Name %in% flex$Name)
+  } else if(length(wr$Name) > 3){
+    flex <- wr[4,]
+    wr <- filter(wr, ! Name %in% flex$Name)
+
+  } else if(length(te$Name) > 1){
+    flex <- te[2,]        
+    te <- filter(te, ! Name %in% flex$Name)
+  }
+  
+  export_lineup <- c(qb$id, rb$id, wr$id, te$id, flex$id, dst$id)
+  
+  if(t == 0) {
+    lineups <- export_lineup 
+    t <- 1
+    }else {
+      lineups <- rbind(lineups, export_lineup)
+      lineups <- unique(lineups)
+      t <- length(lineups[,1])
+  }
+
+}
+
+colnames(lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST")
+write.csv(lineups, "C:/Users/jorda/Downloads/DKLineupsNFL.csv", row.names = FALSE)
+
+```
