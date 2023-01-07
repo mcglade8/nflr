@@ -3,13 +3,14 @@
 ### Classic Lineup Builder LPSolve
 ```{r classic-solver}
 
-numlineups <- 100
+numlineups <- 300
 teams_to_stack <-NULL
 stack_size <- 3
 testing <- F
 locks <- NULL
 bans <- NULL
-use_myproj <- T
+use_myproj <- F
+against_opp_d <- 0 # max number of offensive players allowed against an opposing defense (stacks will never have an opposing defense)
 
 
 if(!testing){
@@ -96,13 +97,24 @@ while(t < numlineups){
   vdst <- as.numeric(data$Position == "DST")
   vplaying <- as.numeric(data$DK.FPs > 0)
   vout  <- as.numeric(data$DK.FPs <= 0)
-
+  vteams <- c()
+  for(i in 1:length(teams)){
+    vteam <- as.numeric(data$TeamAbbrev == teams[i])
+    vopp_def <- as.numeric(data$Opp == teams[i] & data$Position == "DST")*(5-against_opp_d)
+    vteam <- vteam + vopp_def
+    vteams <-c(vteams, vteam)
+  }
   
-  matrix_vector <- c(vsalary, vstack_util, vlocks, vbans, vqb, vwr, vrb, vte, vdst, vplaying, vout)
+  matrix_vector <- c(vsalary, vstack_util, vlocks, vbans, vqb, vwr, vrb, vte, vdst, vplaying, vout, vteams)
   
   const.mat = matrix(matrix_vector, nrow = length(matrix_vector)/length(data$`DK Salary`), byrow=TRUE)
   const.dir = c("<=", ">=", "==", "==","==", ">=", ">=", ">=", "==", "==", "==")
   const.rhs = c(50000, stack_size, sum(vlocks), 0, 1, 3, 2, 1, 1, 9, 0)
+  
+  for(i in 1:length(teams)){
+    const.dir = c(const.dir, "<=")
+    const.rhs = c(const.rhs, 5)
+  }
   
   optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
 
@@ -131,16 +143,27 @@ while(t < numlineups){
   
   export_lineup <- c(qb$id, rb$id, wr$id, te$id, flex$id, dst$id)
   
+  sum_fpts <- sum(objective.in[which(data$Name == qb$Name[1])], objective.in[which(data$Name == rb$Name[1])],objective.in[which(data$Name == rb$Name[2])], objective.in[which(data$Name == wr$Name[1])],objective.in[which(data$Name == wr$Name[2])],objective.in[which(data$Name == wr$Name[3])], objective.in[which(data$Name == te$Name[1])], objective.in[which(data$Name == flex$Name[1])], objective.in[which(data$Name == dst$Name[1])])
+  summary_lineup <- c(qb$Name, rb$Name, wr$Name, te$Name, flex$Name, dst$Name, sum_fpts)
+  
   if(t == 0) {
+    summary_lineups <- summary_lineup
     lineups <- export_lineup 
     t <- 1
     }else {
+      summary_lineups <- rbind(summary_lineups, summary_lineup)
+      summary_lineups <- unique(summary_lineups)
       lineups <- rbind(lineups, export_lineup)
       lineups <- unique(lineups)
       t <- length(lineups[,1])
   }
 
 }
+colnames(summary_lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST", "Projection")
+
+summary_lineups <- as.data.frame(summary_lineups)
+summary_lineups$Projection <- as.numeric(summary_lineups$Projection)
+summary_lineups <- summary_lineups[order(summary_lineups$Projection, decreasing = TRUE),]
 
 colnames(lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST")
 write.csv(lineups, "C:/Users/jorda/Downloads/DKLineupsNFL.csv", row.names = FALSE)
