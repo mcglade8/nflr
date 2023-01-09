@@ -1,5 +1,4 @@
 
-
 ### Classic Lineup Builder LPSolve
 ```{r classic-solver}
 
@@ -181,7 +180,7 @@ testing <- F
 locks <- NULL
 bans <- NULL
 use_myproj <- T
-against_opp_d <- 2 # max number of offensive players allowed against an opposing defense (stacks will never have an opposing defense)
+against_opp_d <- 1 # max number of offensive players allowed against an opposing defense (stacks will never have an opposing defense)
 
 
 if(!testing){
@@ -288,6 +287,10 @@ while(t < numlineups){
     const.rhs = c(const.rhs, 4)
   }
   
+  objective.in[is.nan(objective.in)] <- 0
+  objective.in[is.na(objective.in)] <- 0
+  objective.in[is.infinite(objective.in)] <- 0
+  
   optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
 
   data$optimal <- optimum$solution
@@ -342,5 +345,31 @@ summary_lineups <- summary_lineups[order(summary_lineups$Projection, decreasing 
 
 colnames(lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "D")
 write.csv(lineups, "C:/Users/jorda/Downloads/FDLineupsNFL.csv", row.names = FALSE)
+
+```
+
+
+### filter best lineups for upload
+```{r pick-lineups}
+
+
+num_to_upload <- 10
+
+best_lineups <- head(summary_lineups, n = num_to_upload)
+
+best_lineups <- best_lineups[,1:9]
+
+export_lineups <- best_lineups
+
+for(i in 1:num_to_upload){
+  for(j in 1:length(best_lineups)){
+    export_lineups[i, j] <- data$FDid[which(data$Name == best_lineups[i,j])]
+  }
+}
+
+colnames(export_lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF")
+
+write.csv(export_lineups, "C:/Users/jorda/Downloads/FDLineupsNFL.csv", row.names = FALSE)
+
 
 ```
