@@ -11,6 +11,9 @@ library(dplyr)
 library(tidyverse)
 library(TTR)
 library(coach)
+library(lpSolve)
+library(gsisdecoder)
+library(googlesheets4)
 
 ```
 
@@ -161,8 +164,18 @@ summary(lm_ema_based_qb_points)
 ### Working with roster and position data
 ```{r roster}
 rm(roster)
+
+
+rosters <- nflreadr::load_rosters(2022)
+
+rosters <- rosters %>%
+  select(gsis_id, full_name) %>%
+  rename(player_id = gsis_id)
+
 #roster <- fast_scraper_roster(seasons = 2022) # This isn't working right now so making it myself below
 pbp <- load_pbp(2022) 
+
+weekly <- calculate_player_stats(pbp, weekly = T)
 
 qb_roster <- pbp %>%
   select(posteam, passer_player_id, passer_player_name) %>%
@@ -352,8 +365,259 @@ write.csv(offense_pace_of_play, "C:/Users/jorda/OneDrive//offense_pace_of_play.c
 write.csv(defense_pace_of_play, "C:/Users/jorda/OneDrive//defense_pace_of_play.csv", row.names = FALSE)
 
 
+
+
+### Get sacks and turnovers per game for qbs and dsts
+
+qbsacks <- pbp %>%
+  select(posteam, game_id, sack)
+
+qbsacks$sack[is.na(qbsacks$sack)] <- 0
+
+qbsacks <- qbsacks %>%
+  filter(!is.na(posteam)) %>%
+  group_by(posteam, game_id) %>%
+  summarise(n_sacks = sum(sack))
+
+qbsacks <- qbsacks %>%
+  group_by(posteam) %>%
+  summarise(n_games = n(), n_sacks = sum(n_sacks))
+
+qbsacks$sacks_per_game = qbsacks$n_sacks / qbsacks$n_games
+
+dstsacks <- pbp %>%
+  select(defteam, game_id, sack)
+
+dstsacks$sack[is.na(dstsacks$sack)] <- 0
+
+dstsacks <- dstsacks %>%
+  group_by(defteam, game_id) %>%
+  summarise(n_sacks = sum(sack))
+
+dstsacks$n_sacks[is.na(dstsacks$n_sacks)] <- 0
+
+dstsacks <- dstsacks %>%
+  group_by(defteam) %>%
+  summarise(n_games = n(), n_sacks = sum(n_sacks))
+
+dstsacks$sacks_per_game = dstsacks$n_sacks / dstsacks$n_games
+
+off_turnovers <- pbp %>%
+  select(posteam, game_id, interception, fumble_lost)
+
+off_turnovers$interception[is.na(off_turnovers$interception)] <- 0
+off_turnovers$fumble_lost[is.na(off_turnovers$fumble_lost)] <- 0
+
+off_turnovers <- off_turnovers %>%
+  group_by(posteam, game_id) %>%
+  summarise(n_ints = sum(interception), n_fum_lost = sum(fumble_lost))
+
+off_turnovers$n_ints[is.na(off_turnovers$n_ints)] <- 0
+off_turnovers$n_fum_lost[is.na(off_turnovers$n_fum_lost)] <- 0
+
+off_turnovers <- off_turnovers %>%
+  group_by(posteam) %>%
+  summarise(n_games = n(), n_ints = sum(n_ints), n_fum_lost = sum(n_fum_lost))
+
+off_turnovers$turnovers <- (off_turnovers$n_fum_lost + off_turnovers$n_ints)/off_turnovers$n_games
+
+
+def_turnovers <- pbp %>%
+  select(defteam, game_id, interception, fumble_lost)
+
+def_turnovers$interception[is.na(def_turnovers$interception)] <- 0
+def_turnovers$fumble_lost[is.na(def_turnovers$fumble_lost)] <- 0
+
+def_turnovers <- def_turnovers %>%
+  group_by(defteam, game_id) %>%
+  summarise(n_ints = sum(interception), n_fum_lost = sum(fumble_lost))
+
+def_turnovers$n_ints[is.na(def_turnovers$n_ints)] <- 0
+def_turnovers$n_fum_lost[is.na(def_turnovers$n_fum_lost)] <- 0
+
+def_turnovers <- def_turnovers %>%
+  group_by(defteam) %>%
+  summarise(n_games = n(), n_ints = sum(n_ints), n_fum_lost = sum(n_fum_lost))
+
+def_turnovers$turnovers <- (def_turnovers$n_fum_lost + def_turnovers$n_ints)/def_turnovers$n_games
+
+qbsacks <- qbsacks %>%
+  rename(team = posteam, sacks_taken = sacks_per_game) %>%
+  select(team, sacks_taken)
+
+dstsacks <- dstsacks %>%
+  rename(team = defteam, sacks_earned = sacks_per_game) %>%
+  select(team, sacks_earned)
+
+sacks <- merge(qbsacks, dstsacks)
+
+off_turnovers <- off_turnovers %>%
+  rename(team = posteam, turnovers_allowed = turnovers) %>%
+  select(team, turnovers_allowed)
+
+def_turnovers <- def_turnovers %>%
+  rename(team = defteam, turnovers_earned = turnovers) %>%
+  select(team, turnovers_earned)
+
+turnovers <- merge(off_turnovers, def_turnovers)
+
+dst_export <- merge(sacks, turnovers)
+
+write.csv(dst_export, "C:/Users/jorda/Downloads/dst_export.csv", row.names = FALSE)
+
 ```
 
+
+### FPs by game and correlation
+```{r fps-by-game-and-correlation}
+
+
+rosters <- nflreadr::load_rosters(2022)
+
+rosters <- rosters %>%
+  select(gsis_id, full_name) %>%
+  rename(player_id = gsis_id)
+
+pass_fps_by_game <- pbp %>%
+  filter(!is.na(passer_player_id)) %>%
+  group_by(game_id, passer_player_id, passer_player_name, posteam, defteam) %>%
+  summarise(pass_fpts = sum(pass_fps)) %>%
+  rename(player_id = passer_player_id, player_name = passer_player_name)
+rush_fps_by_game <- pbp %>%
+  filter(!is.na(rusher_player_id)) %>%
+  group_by(game_id, rusher_player_id, rusher_player_name, posteam, defteam) %>%
+  summarise(rush_fpts = sum(rush_fps)) %>%
+  rename(player_id = rusher_player_id, player_name = rusher_player_name)
+rec_fps_by_game <- pbp %>%
+  filter(!is.na(receiver_player_id)) %>%
+  group_by(game_id, receiver_player_id, receiver_player_name, posteam, defteam) %>%
+  summarise(rec_fpts = sum(rec_fps)) %>%
+  rename(player_id = receiver_player_id, player_name = receiver_player_name)
+
+game_fpts <- merge(merge(pass_fps_by_game, rush_fps_by_game, all = TRUE), rec_fps_by_game, all = TRUE)
+game_fpts[is.na(game_fpts)] <- 0
+
+determine_position <- game_fpts %>%
+  group_by(player_id) %>%
+  summarise(pass_fpts = sum(pass_fpts), rush_fpts = sum(rush_fpts), rec_fpts = sum(rec_fpts)) 
+
+determine_position <-determine_position %>%
+  group_by(player_id) %>%
+  summarise(position = case_when(pass_fpts > rush_fpts && pass_fpts > rec_fpts ~ "QB",
+                               rush_fpts > pass_fpts && rush_fpts > rec_fpts ~ "RB",
+                               rec_fpts > pass_fpts && rec_fpts > rush_fpts ~ "REC"))
+
+
+game_fpts <- merge(game_fpts, determine_position)
+
+game_fpts$rush_fpts <- round(game_fpts$rush_fpts, digits = 1)
+
+game_fpts$game_fpts <- game_fpts$pass_fpts +game_fpts$rush_fpts + game_fpts$rec_fpts 
+
+team_fpts_by_game <- game_fpts %>%
+  group_by(game_id, posteam) %>%
+  summarise(team_pass_fpts = sum(pass_fpts), team_rush_fpts = sum(rush_fpts), team_rec_fpts = sum(rec_fpts))
+
+opp_fpts_by_game <- game_fpts %>%
+  group_by(game_id, defteam) %>%
+  summarise(opp_pass_fpts = sum(pass_fpts), opp_rush_fpts = sum(rush_fpts), opp_rec_fpts = sum(rec_fpts))
+
+game_fpts <- merge(game_fpts, team_fpts_by_game) %>%
+  merge(opp_fpts_by_game) %>%
+  mutate(rot_pass_fpts = team_pass_fpts - pass_fpts, rot_rush_fpts = team_rush_fpts - rush_fpts, rot_rec_fpts = team_rec_fpts - rec_fpts)
+
+player_list <- game_fpts$player_id %>%
+  unique()
+
+  correlation <- game_fpts %>%
+    filter(player_id == player_list[1])
+  
+  correlation$qb_cor <- cor(correlation$game_fpts, correlation$rot_pass_fpts)
+  correlation$rb_cor <- cor(correlation$game_fpts, correlation$rot_rush_fpts)
+  correlation$rec_cor <- cor(correlation$game_fpts, correlation$rot_rec_fpts)
+  correlation$opp_qb_cor <- cor(correlation$game_fpts, correlation$opp_pass_fpts)
+  correlation$opp_rb_cor <- cor(correlation$game_fpts, correlation$opp_rush_fpts)
+  correlation$opp_rec_cor <- cor(correlation$game_fpts, correlation$opp_rec_fpts)
+
+for(i in 2:length(player_list)){
+  #correlate to team qb
+  correlation2 <- game_fpts %>%
+    filter(player_id == player_list[i])
+  
+  correlation2$qb_cor <- cor(correlation2$game_fpts, correlation2$rot_pass_fpts)
+  correlation2$rb_cor <- cor(correlation2$game_fpts, correlation2$rot_rush_fpts)
+  correlation2$rec_cor <- cor(correlation2$game_fpts, correlation2$rot_rec_fpts)
+  correlation2$opp_qb_cor <- cor(correlation2$game_fpts, correlation2$opp_pass_fpts)
+  correlation2$opp_rb_cor <- cor(correlation2$game_fpts, correlation2$opp_rush_fpts)
+  correlation2$opp_rec_cor <- cor(correlation2$game_fpts, correlation2$opp_rec_fpts)
+  
+  correlation <- rbind(correlation, correlation2)
+}
+
+correlation <- correlation %>%
+  select(player_id, qb_cor, rb_cor, rec_cor, opp_qb_cor, opp_rb_cor, opp_rec_cor) %>%
+  distinct()
+
+correlation[is.na(correlation)] <- 0
+
+correlation <- merge(correlation, rosters)
+
+correlation <- merge(correlation, determine_position)
+
+determine_position <- merge(determine_position, rosters)
+
+sd_fpts <- game_fpts %>%
+  group_by(player_name) %>%
+  summarise(sd_fpts = sd(game_fpts))
+
+sd_fpts[is.na(sd_fpts)] <- 0
+
+sd_fpts <- rename(sd_fpts, sdfind = player_name, sd = sd_fpts)
+
+
+
+```
+
+### current roster
+```{r current-roster}
+current_roster <- fast_scraper_roster(2022) %>%
+  filter(position %in% c("WR", "QB", "RB", "TE")) %>%
+  select(full_name, position, team) %>%
+  filter(!is.na(team))
+
+write.csv(current_roster, "C:/Users/jorda/OneDrive//roster_info.csv", row.names = FALSE)
+
+```
+
+### RBG
+```{r receiving-rushing-by-game}
+
+rec_by_game <- pbp %>%
+  group_by(game_id, posteam, defteam, receiver_player_id, receiver_player_name, passer_player_name, passer_player_id) %>%
+  summarise(rec_tds = sum(pass_touchdown), rec_yards = sum(yards_gained), rec_fps = sum(rec_fps), pass_fps=sum(pass_fps), epa = sum(epa)) %>%
+  filter(!is.na(receiver_player_id))
+
+rec_by_game[is.na(rec_by_game)] <-0
+
+rec_szn_avgs <- rec_by_game %>%
+  group_by(receiver_player_id, receiver_player_name) %>%
+  summarise(rec_tds_per_game = mean(rec_tds), rec_yards_per_game = mean(rec_yards), pass_fps_added_per_game = mean(pass_fps), mean_rec_fps = mean(rec_fps), mean_epa = mean(epa), games = n()) %>%
+  filter(games > 5)
+
+passer_szn_avgs <- rec_by_game %>%
+  group_by(passer_player_name, passer_player_id, game_id) %>%
+  summarise(pass_tds_per_game = sum(rec_tds), pass_yards_per_game = sum(rec_yards), pass_fps_per_game = sum(pass_fps), rec_fps_added_per_game = sum(rec_fps), mean_epa = sum(epa))%>%
+  group_by(passer_player_name, passer_player_id) %>%
+  summarise(pass_tds_per_game = mean(pass_tds_per_game), pass_yards_per_game = mean(pass_yards_per_game), sd_pass_fps = sd(pass_fps_per_game, na.rm=TRUE), pass_fps_per_game = mean(pass_fps_per_game), sd_rec_fps = sd(rec_fps_added_per_game, na.rm=TRUE), rec_fps_added_per_game = mean(rec_fps_added_per_game),  mean_epa = mean(mean_epa), games = n()) %>%
+  filter(games >5)
+
+dst_szn_avgs <- rec_by_game %>%
+  group_by(defteam, game_id) %>%
+  summarise(pass_tds_per_game = sum(rec_tds), pass_yards_per_game = sum(rec_yards), pass_fps_per_game = sum(pass_fps), rec_fps_added_per_game = sum(rec_fps), mean_epa = sum(epa)) %>%
+  group_by(defteam) %>%
+  summarise(pass_tds_per_game = mean(pass_tds_per_game), pass_yards_per_game = mean(pass_yards_per_game), sd_pass_fps = sd(pass_fps_per_game, na.rm=TRUE), pass_fps_per_game = mean(pass_fps_per_game), sd_rec_fps = sd(rec_fps_added_per_game, na.rm=TRUE), rec_fps_added_per_game = mean(rec_fps_added_per_game),  mean_epa = mean(mean_epa), games = n())
+
+```
 
 ### SD team
 ```{r standard-deviations}
@@ -372,25 +636,42 @@ write.csv(pass_sd, "C:/Users/jorda/OneDrive//pass_sd.csv", row.names = FALSE)
 
 ```
 
-### Coach lineup builder
+### DK lineup builder
 ```{r lineup-builder}
 ### ~~~ Parameters ~~~ ###
 
 set.seed(NULL)              # Seed is NULL so as not to create the same lineups every time
-teams_to_stack <- c("GB")  # Use one team at a time to ensure QB is stacked with teammates
-stack_sizes <- 3 #3           # Number of players in stack
-num_lineups <- 10 #23           # Number of lineups to create #20 ARI; 10 TB, 20 BUF, 10 CLE, 9 BAL
-bans <- c("Drew Sample")
+teams_to_stack <- NULL #c("MIA")  # Use one team at a time to ensure QB is stacked with teammates
+stack_sizes <-NULL           # Number of players in stack
+num_lineups <- 10 #9           # Number of lineups to create 12 CIN, 10 MIA, 10 CLE
+bans <- NULL#c("Teddy Bridgewater", "Joe Mixon", "Rashaad Penny")
+max_exposure <- 1
 
 
 ### SlateProjections exported from NFL Matchups sheet PP Upside; import upside finder from PlayerProfiler (check cell A1 comment)
 
+SlateProjections <- read.csv("C:/Users/jorda/Downloads/DKImpliedProjectionsNFL.csv")
+DSTProjections <- read.csv("C:/Users/jorda/Downloads/DSTImpliedProjections.csv")
+
 SlateProjections <- SlateProjections %>%
-  select(player_id, Projected.Points, SD)
+  merge(sd_fpts, all.x = TRUE) %>%
+  select(Name, DK.FPs, sd_fpts) %>%
+  rename(player = Name, Projected.Points = DK.FPs, SD = sd_fpts) %>%
+  mutate(SD = case_when(
+    player =="Deshaun Watson" ~ 11.5,
+    player == "Mike White" ~ 6,
+    is.na(SD) ~ 0.2,
+    T ~ SD
+  ))
+
+DSTProjections <- select(DSTProjections, DST, xfp) %>%
+  filter(xfp != "#N/A") %>%
+  rename(team = DST, fpts_proj = xfp) %>%
+  mutate(fpts_proj = as.numeric(fpts_proj))
 
 ### Be sure to have downloaded salaries from DK to the below file location
 
-data <- read_dk("C:/Users/jorda/Downloads/DKSalaries.csv") 
+data <- read_dk("C:/Users/jorda/Downloads/DKSalariesNFL.csv") 
 
 bans <- data %>%
   filter(player %in% bans) %>%
@@ -411,19 +692,23 @@ stacked_dst <- dst_data %>%
 
 unstacked_dst <- dst_data %>%
   filter(!team %in% teams_to_stack & !opp_team %in% teams_to_stack)%>%
-  mutate(fpts_proj = .001*salary + .3*fpts_avg, SD = 2)
+  select(-fpts_proj) %>%
+  merge(DSTProjections) %>%
+  mutate(SD = fpts_proj/2)
 
 dst_data <- rbind(stacked_dst, unstacked_dst)
 }else{
     dst_data <-dst_data %>%
-      mutate(fpts_proj = .001*salary + .3*fpts_avg, SD = 2)
+    select(-fpts_proj) %>%
+    merge(DSTProjections) %>%
+    mutate(SD = fpts_proj/2)
 }
 
 qb_data <- data %>%
   filter(position == "QB") 
 
 qb_data <-qb_data %>%
-  merge(SlateProjections, by = "player_id") 
+  merge(SlateProjections, by = "player") 
 
 qb_data <-qb_data %>%
   select(-fpts_proj) %>%
@@ -450,9 +735,10 @@ qb_data <- rbind(stacked_qbs, non_stacked_qbs)
 
 data <- data %>%
   filter(position != "DST" & position != "QB") %>%
-  merge(SlateProjections, by = "player_id", all.x = TRUE) %>%
+  merge(SlateProjections, by = "player", all.x = TRUE) %>%
   select(-fpts_proj) %>%
-  rename(fpts_proj = Projected.Points)
+  rename(fpts_proj = Projected.Points) %>%
+  filter(fpts_proj > 3)
   
 data <- data %>%
   rbind(dst_data) %>%
@@ -460,6 +746,9 @@ data <- data %>%
 
 data[is.na(data)] <- 0
 data <- data[order(data$row_id),]
+for(i in 1:length(data$row_id)){
+  data$row_id[i] <- i
+}
 
 model <- model_dk_nfl(data)
 
@@ -467,18 +756,315 @@ n <- nrow(data)
 randomness <- function(x) rnorm(n, mean = data$fpts_proj, sd = data$SD)
 
 rm(results)
-results <- optimize_generic(data, model, L = num_lineups, randomness = randomness, stack_sizes = stack_sizes, stack_teams = teams_to_stack, bans = bans$row_id)
-write_lineups(results, "C:/Users/jorda/OneDrive//mylineups.csv", site = "draftkings", sport = "nfl")
+results <- optimize_generic(data, model, L = num_lineups, randomness = randomness, stack_sizes = stack_sizes, stack_teams = teams_to_stack, max_exposure = max_exposure)#, bans = bans$row_id)
+write_lineups(results, "C:/Users/jorda/Downloads/DKlineupsNFL.csv", site = "draftkings", sport = "nfl")
 
 ```
 
 
+### DK lineup builder with tide
+```{r tide-lineup-builder}
+### ~~~ Parameters ~~~ ###
+
+set.seed(NULL)              # Seed is NULL so as not to create the same lineups every time
+pteams_to_stack <- c("KC", "MIN") # if null, can stack any team. otherwise stacks will be in this list
+stack_sizes <- 3           # Number of players in stack
+num_lineups <- 45 #9           # Number of lineups to create 12 CIN, 10 MIA, 10 CLE
+pbans <- NULL#c("Teddy Bridgewater", "Joe Mixon", "Rashaad Penny") # Uncomment in optimize_generic
+plocks <- NULL
+max_exposure <- 1
+use_myproj <- T
+testing <- F
+
+
+### SlateProjections exported from NFL Matchups sheet PP Upside; import upside finder from PlayerProfiler (check cell A1 comment)
+
+if(!testing){
+oSlateProjections <- read_sheet("https://docs.google.com/spreadsheets/d/1CjCVMPLzgX1JONYas7GbXyV9ZEwWXPmDfH6pAgm-ZA8/edit#gid=537166457") %>%
+  filter(!is.na(DK.FPs))
+if(use_myproj){oSlateProjections$DK.FPs <- oSlateProjections$myproj}
+SlateProjections <- oSlateProjections
+
+### Be sure to have downloaded salaries from DK to the below file location
+if(!testing){
+odata <- read_dk("C:/Users/jorda/Downloads/DKSalariesNFL.csv") 
+}
+data <- odata
+}else{
+  SlateProjections <- oSlateProjections
+  data <- odata
+
+}
+
+tides <- data %>%
+  select(team, opp_team) %>%
+  distinct()
+
+tides$tide <- rnorm(length(tides$team), 0, 3.5)
+
+otides <- tides %>%
+  select(-opp_team) 
+
+dtides <- tides %>%
+  select(-team) %>%
+  rename(team = opp_team) %>%
+  mutate(tide = -tide)
+
+SlateProjections <- SlateProjections %>%
+  merge(sd_fpts, all.x = TRUE) %>%
+  select(Name, DK.FPs, sd_fpts) %>%
+  rename(player = Name, Projected.Points = DK.FPs, SD = sd_fpts) %>%
+  mutate(SD = case_when(
+    player =="Deshaun Watson" ~ 8.5,
+    player == "Mike White" ~ 6,
+    is.na(SD) ~ 0.2*Projected.Points,
+    T ~ SD
+  ))
+
+
+
+
+### Treating DST and QB data differently so they are addressed correctly for the purpose of stacking
+
+dst_data <- data %>%
+  filter(position == "DST") %>%
+  merge(dtides) %>%
+  mutate(SD = case_when(fpts_proj <1 ~ 1, T ~ fpts_proj/2))
+
+
+data <- data %>%
+  filter(position != "DST") %>%
+  merge(SlateProjections, by = "player", all.x = TRUE) %>%
+  select(-fpts_proj) %>%
+  rename(fpts_proj = Projected.Points) %>%
+  filter(fpts_proj > 3) %>%
+  merge(otides)
+  
+data <- data %>%
+  rbind(dst_data)
+
+data[is.na(data)] <- 0
+
+### Set up data for stacking
+
+data <- data %>%
+  mutate(fhold = fpts_proj, shold = SD, fpts_proj = fhold+tide, SD = shold + tide/2) %>%
+  mutate(SD = case_when(SD < 1 ~ 1, T ~ SD))
+
+starting_qbs <- data %>%
+  filter(position == "QB", fhold > 0, player != "Taysom Hill")
+
+#data <- data[order(data$row_id),]
+#
+starting_qbs <- starting_qbs[order(starting_qbs$team),]
+
+if(!is.null(pteams_to_stack)){
+  starting_qbs <- filter(starting_qbs, team %in% pteams_to_stack) # if I have stacks identified, will limit stack pool to just those teams
+}
+
+pickstack <-data %>%
+  group_by(team)%>%
+  summarise(team_fps = sum(fpts_proj)) %>%
+  filter(team %in% starting_qbs$team)
+
+pickstack <- pickstack[order(pickstack$team),]
+
+
+if(!is.null(pteams_to_stack)){
+  pickstack <- filter(pickstack, team %in% pteams_to_stack) # if I have stacks identified, will limit stack pool to just those teams
+}
+
+find_qb <- which.max(pickstack$team_fps)
+pickstack <- pickstack$team[find_qb] # add as teams to stack
+qb <- starting_qbs$player[find_qb] # add to locks
+rm_def <- data %>%
+  filter(player == qb) 
+rm_def <- rm_def$opp_team[1] # add to bans
+rm_def <- data %>%
+  filter(team == rm_def, position == "DST")
+rm_def <- rm_def$player[1]
+find_pc <- data %>% # add to locks (find pass catcher)
+  filter(team == pickstack, position %in% c("WR", "TE"))
+find_pc$fpts_proj <- rnorm(length(find_pc$fpts_proj), find_pc$fhold, find_pc$shold)
+
+wr <- which.max(find_pc$fpts_proj)
+wr <- find_pc$player[wr]
+
+data <- data %>%
+  mutate(fpts_proj = case_when(player == qb ~ 1000,
+                               player == wr ~ 1000,
+                               player == rm_def ~ -1000,
+                               T ~ fpts_proj))
+
+bans <- c(pbans, rm_def)
+locks <- c(plocks, qb, wr)
+teams_to_stack <- c(pteams_to_stack, pickstack)
+
+data <- data[order(data$row_id),]
+for(i in 1:length(data$row_id)){
+  data$row_id[i] <- i
+}
+
+bans <- data %>%
+  filter(player %in% bans) %>%
+  select(row_id)
+
+locks <- data %>%
+  filter(player %in% locks) %>%
+  select(row_id)
+
+
+model <- model_dk_nfl(data)
+n <- nrow(data) 
+randomness <- function(x) rnorm(n, x, sd = data$SD)
+
+results <- optimize_generic(data = data, model = model, L = 1, randomness = randomness, bans = bans$row_id, locks = locks$row_id, stack_teams = teams_to_stack, stack_sizes = stack_sizes, max_exposure = max_exposure)
+
+for(i in 1:(num_lineups-1)){
+
+data <- odata
+SlateProjections <- oSlateProjections
+
+
+tides <- data %>%
+  select(team, opp_team) %>%
+  distinct()
+
+tides$tide <- rnorm(length(tides$team), 0, 3.5)
+
+otides <- tides %>%
+  select(-opp_team) 
+
+dtides <- tides %>%
+  select(-team) %>%
+  rename(team = opp_team) %>%
+  mutate(tide = -tide)
+
+SlateProjections <- SlateProjections %>%
+  merge(sd_fpts, all.x = TRUE) %>%
+  select(Name, DK.FPs, sd_fpts) %>%
+  rename(player = Name, Projected.Points = DK.FPs, SD = sd_fpts) %>%
+  mutate(SD = case_when(
+    player =="Deshaun Watson" ~ 8.5,
+    player == "Mike White" ~ 6,
+    is.na(SD) ~ 0.2*Projected.Points,
+    T ~ SD
+  ))
+
+### Be sure to have downloaded salaries from DK to the below file location
+
+
+
+### Treating DST and QB data differently so they are addressed correctly for the purpose of stacking
+
+dst_data <- data %>%
+  filter(position == "DST") %>%
+  merge(dtides) %>%
+  mutate(SD = case_when(fpts_proj <1 ~ 1, T ~ fpts_proj/2))
+
+
+data <- data %>%
+  filter(position != "DST") %>%
+  merge(SlateProjections, by = "player", all.x = TRUE) %>%
+  select(-fpts_proj) %>%
+  rename(fpts_proj = Projected.Points) %>%
+  filter(fpts_proj > 3) %>%
+  merge(otides)
+  
+data <- data %>%
+  rbind(dst_data)
+
+data[is.na(data)] <- 0
+
+### Set up data for stacking
+
+data <- data %>%
+  mutate(fhold = fpts_proj, shold = SD, fpts_proj = fhold+tide, SD = shold + tide/2) %>%
+  mutate(SD = case_when(SD < 1 ~ 1, T ~ SD))
+
+starting_qbs <- data %>%
+  filter(position == "QB", fhold > 0, player != "Taysom Hill")
+
+starting_qbs <- starting_qbs[order(starting_qbs$team),]
+
+if(!is.null(pteams_to_stack)){
+  starting_qbs <- filter(starting_qbs, team %in% pteams_to_stack) # if I have stacks identified, will limit stack pool to just those teams
+}
+pickstack <-data%>%
+  group_by(team)%>%
+  summarise(team_fps = sum(fpts_proj)) %>%
+  filter(team %in% starting_qbs$team)
+
+pickstack <- pickstack[order(pickstack$team),]
+
+
+if(!is.null(pteams_to_stack)){
+  pickstack <- filter(pickstack, team %in% pteams_to_stack) # if I have stacks identified, will limit stack pool to just those teams
+}
+
+find_qb <- which.max(pickstack$team_fps)
+pickstack <- pickstack$team[find_qb] # add as teams to stack
+qb <- starting_qbs$player[find_qb] # add to locks
+rm_def <- data %>%
+  filter(player == qb) 
+rm_def <- rm_def$opp_team[1] # add to bans
+rm_def <- data %>%
+  filter(team == rm_def, position == "DST")
+rm_def <- rm_def$player[1]
+find_pc <- data %>% # add to locks (find pass catcher)
+  filter(team == pickstack, position %in% c("WR", "TE"))
+find_pc$fpts_proj <- rnorm(length(find_pc$fpts_proj), find_pc$fhold, find_pc$shold)
+wr <- which.max(find_pc$fpts_proj)
+wr <- find_pc$player[wr]
+
+
+data <- data %>%
+  mutate(fpts_proj = case_when(player == qb ~ 1000,
+                               player == wr ~ 1000,
+                               player == rm_def ~ -1000,
+                               T ~ fpts_proj))
+
+bans <- c(pbans, rm_def)
+locks <- c(plocks, qb, wr)
+teams_to_stack <- c(pteams_to_stack, pickstack)
+
+data <- data[order(data$row_id),]
+for(i in 1:length(data$row_id)){
+  data$row_id[i] <- i
+}
+
+bans <- data %>%
+  filter(player %in% bans) %>%
+  select(row_id)
+
+locks <- data %>%
+  filter(player %in% locks) %>%
+  select(row_id)
+
+
+model <- model_dk_nfl(data)
+n <- nrow(data) 
+randomness <- function(x) rnorm(n, x, sd = data$SD)
+
+  addresult <- optimize_generic(data, model, L = 1, randomness = randomness, stack_sizes = stack_sizes, stack_teams = teams_to_stack, max_exposure = max_exposure, bans = bans$row_id, locks = locks$row_id)
+  results <- append(results, addresult, after = length(results))
+
+}
+
+if(testing){write.csv(odata, "C:/Users/jorda/Downloads/olddata.csv")}
+write_lineups(results, "C:/Users/jorda/Downloads/DKlineupsNFL.csv", site = "draftkings", sport = "nfl")
+
+```
+
 ### sim SD Optimal
 ```{r sim-showdown}
+
+SDOptimal <- read.csv("C:/Users/jorda/Downloads/SDOptimal.csv")
+
 SDOptimal <- SDOptimal %>%
   mutate(proj = as.numeric(Projected.Pts), sd = as.numeric(SD))%>%
   filter(Projected.Pts != "#N/A") %>%
-  select(Name, Salary, proj, sd, GPP.Need, FLEX.own, CPT.own)
+  select(Name, TeamAbbrev, Salary, proj, sd, GPP.Need, FLEX.own, CPT.own)
 
 SDOptimal$FLEX.own <- gsub("%", "", as.character(SDOptimal$FLEX.own))
 SDOptimal$CPT.own <- gsub("%", "", as.character(SDOptimal$CPT.own))
@@ -654,5 +1240,907 @@ sr_summary <- sr_summary %>%
     cpt_leverage_value = top_value*(100-cpt)/100,
     flex_leverage_value = top_six_value*(100-flex)/100
   )
+
+```
+
+
+
+### LP Solver Showdown
+```{r lp-solver-showdown}
+
+
+## Parameters
+
+
+num_lineups <-93
+use_myproj <- T #use if wanting to override projections with column myproj in sheet
+testing <- F
+#lineups <- data.frame(nrows = 6)
+pb <- txtProgressBar(0, num_lineups, style = 3)
+pass_catchers_w_qb <- 2 # minimum WRs and TEs to include with their QB
+lineups_w_qb <- .70 # percent of lineups where a qb is forced; remaining lineups may still include a qb 
+max_ag_d <- 3
+salary_per_team <- 6400 # minimum FLEX salary used  per team; so you don't get one-off Boston Scott in an onslaught
+my_lean <- "KC"
+dart_throw_cutoff <- 5
+
+
+if(!testing){
+SDOptimal <- read_sheet("https://docs.google.com/spreadsheets/d/1CjCVMPLzgX1JONYas7GbXyV9ZEwWXPmDfH6pAgm-ZA8/edit#gid=537166457")%>%
+  select(Name, DK.FPs, sd_fpts, myproj, shape1, shape2) %>%
+  distinct()
+salaries <- read.csv("C:/Users/jorda/Downloads/DKSalariesNFL.csv") %>%
+  mutate(Name = case_when(Position == "DST" ~ gsub(" ", "", Name), T ~ Name))
+
+cpts <- filter(salaries, Roster.Position == "CPT") %>%
+  merge(SDOptimal) %>%
+  mutate(DK.FPs = DK.FPs*1.5, sd_fpts = sd_fpts * 1.5, myproj = myproj * 1.5)
+flex <- filter(salaries, !Roster.Position == "CPT") %>%
+  merge(SDOptimal)
+names <- flex$Name
+
+SDOptimal <- rbind(cpts, flex)
+
+if(!use_myproj){
+SDOptimal <- SDOptimal %>%
+  rename(proj = DK.FPs)}else{
+SDOptimal <- SDOptimal %>%
+  rename(proj = myproj)}
+
+
+SDOptimal <- filter(SDOptimal, !is.na(proj) & proj >= 1)
+SDOptimal$holdp <- SDOptimal$proj
+SDOptimal$holds <- SDOptimal$sd_fpts
+}
+
+j <- 1
+while(j <= num_lineups){
+  
+force_qb <- runif(1) < lineups_w_qb
+  
+teams <- SDOptimal %>%
+  select(TeamAbbrev) %>%
+  distinct()
+
+teams$tide <- rnorm(2, 0, .5)
+
+SDOptimal <- merge(SDOptimal, teams) %>%
+  mutate(proj = holdp * (tide) * case_when(TeamAbbrev == my_lean ~ 1.2, T~1)) %>%
+  select(-tide)
+
+SDOptimal$over_under <- as.numeric(runif(nrow(SDOptimal)) >= .5)
+SDOptimal$sd_fpts <- SDOptimal$holds*(.7+.6*SDOptimal$over_under)
+
+## Set coefficients of the decision variables
+
+objective.in <- (rbeta(nrow(SDOptimal), shape1 = SDOptimal$shape1, shape2 = SDOptimal$shape2) - betamedian(SDOptimal$shape1, SDOptimal$shape2)) * SDOptimal$holds * 2 + SDOptimal$proj
+
+#test <- (rbeta(1000, shape1 = 4, shape2 = 4) -.5)* 13 + 26.3
+
+
+## Create constraint matrix
+
+vsalary <- SDOptimal$Salary
+vcpt <- as.numeric(SDOptimal$Roster.Position == "CPT") * as.numeric(!SDOptimal$Position == "K")
+vflex <- as.numeric(SDOptimal$Roster.Position == "FLEX")
+vnames <- c()
+for(n in 1:length(names)){
+  this_name <- as.numeric(SDOptimal$Name == names[n])
+  vnames <- c(vnames, this_name)
+}
+vteam1 <- as.numeric(SDOptimal$TeamAbbrev == teams$TeamAbbrev[1])
+vteam2 <- as.numeric(SDOptimal$TeamAbbrev == teams$TeamAbbrev[2])
+vplayers <- rep(1, length(vsalary))
+vpasscatcherswqb <- as.numeric(SDOptimal$Position == "QB")*(-pass_catchers_w_qb)+as.numeric(SDOptimal$Position %in% c("WR", "TE"))
+vforce_qb <- as.numeric(SDOptimal$Position == "QB") * as.numeric(force_qb)
+vmaxagd1 <- as.numeric(SDOptimal$Position == "DST" & SDOptimal$TeamAbbrev == teams$TeamAbbrev[1])*(6-max_ag_d) +as.numeric(SDOptimal$TeamAbbrev == teams$TeamAbbrev[2])
+vmaxagd2 <- as.numeric(SDOptimal$Position == "DST" & SDOptimal$TeamAbbrev == teams$TeamAbbrev[2])*(6-max_ag_d) +as.numeric(SDOptimal$TeamAbbrev == teams$TeamAbbrev[1])
+vdarts <- as.numeric(SDOptimal$proj < dart_throw_cutoff)
+
+matrix_vector <- c(vsalary, vcpt, vflex, vteam1, vteam2, vplayers, vpasscatcherswqb*vteam1, vpasscatcherswqb*vteam2, vforce_qb, vmaxagd1, vmaxagd2, vsalary*vteam1*vflex, vsalary*vteam2*vflex, vdarts, vnames)
+const.mat = matrix(matrix_vector, nrow = length(matrix_vector)/length(SDOptimal$TeamAbbrev), byrow=TRUE)
+
+
+const.rhs = c(50000, 1, 5, 5, 5, 6, 0, 0, 1, 6, 6, salary_per_team, salary_per_team, 2)
+const.dir = c("<=", "==", "==", "<=", "<=", "==", ">=", ">=", ">=", "<=", "<=", ">=", ">=", "<=")
+
+for(n in names){
+  const.rhs = c(const.rhs, 1)
+  const.dir = c(const.dir, "<=")
+}
+
+optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
+
+SDOptimal$optimal <- optimum$solution
+
+lineup <- filter(SDOptimal, optimal == 1)
+
+lineup <- lineup[order(lineup$Roster.Position),]
+lineup <- lineup$ID
+
+if(j > 1){
+  lineups <- rbind(lineups, lineup)
+  lineups <- unique(lineups)
+  j <- nrow(lineups)+1
+
+} else{
+  lineups <- lineup
+  j <- 2
+}
+
+setTxtProgressBar(pb, j)
+
+
+}
+
+columns <- c("CPT", "FLEX", "FLEX", "FLEX", "FLEX", "FLEX")
+colnames(lineups) <- columns
+
+CPTownership <- SDOptimal %>%
+  filter(Roster.Position == "CPT") %>%
+  select(Name, ID)
+FLEXownership <- SDOptimal %>%
+  filter(Roster.Position == "FLEX") %>%
+  select(Name, ID)
+
+CPTownership$CPT.Own <- 0
+FLEXownership$FLEX.Own <- 0
+
+for(i in 1:length(FLEXownership$Name)){
+  CPTownership$CPT.Own[i] = sum(lineups[,1] == CPTownership$ID[i])
+  FLEXownership$FLEX.Own[i] = sum(lineups[,2:6] == FLEXownership$ID[i])
+  
+}
+FLEXownership <- select(FLEXownership, -ID)
+CPTownership <- select(CPTownership, -ID)
+rm(ownership)
+ownership <- merge(CPTownership, FLEXownership, all = FALSE)
+ownership$FLEX.Own <- ownership$FLEX.Own/length(lineups[,1])*100
+ownership$CPT.Own <- ownership$CPT.Own/length(lineups[,1])*100
+
+ownership$total <- ownership$FLEX.Own + ownership$CPT.Own
+
+write.csv(lineups, "C:/Users/jorda/Downloads/DKLineupsNFL.csv", row.names = FALSE)
+
+```
+
+
+
+### check shape
+```{r check-beta-shape}
+
+s1 <- 1
+s2 <- 2.5
+
+test <- (rbeta(1000, shape1 = s1, shape2 = s2) - betamedian(s1, s2))
+hist(test)
+
+```
+
+### SD Lineup Editor
+```{r lineup-editor}
+### Build lineups above, then use this to edit entries for direct upload
+plineups <- read.csv("C:/Users/jorda/Downloads/DKEntriesNFL.csv")
+plineups <- filter(plineups, !is.na(Entry.ID) & !is.na(as.numeric(Entry.ID))) %>%
+  select(Entry.ID, Contest.Name, Contest.ID, Entry.Fee)
+newlineups <- read.csv("C:/Users/jorda/Downloads/DKLineupsNFL.csv")
+newlineups <- cbind(plineups, newlineups)
+colnames(newlineups) <- c("Entry ID", "Contest Name", "Contest ID", "Entry Fee", "CPT", "FLEX","FLEX","FLEX","FLEX","FLEX")
+write.csv(newlineups, "C:/Users/jorda/Downloads/DKEntriesNFL.csv", row.names = FALSE)
+```
+
+
+### FD Lineup Builder
+```{r solver}
+### ~~~ Parameters ~~~ ###
+
+set.seed(NULL)              # Seed is NULL so as not to create the same lineups every time
+teams_to_stack <- NULL#c("MIA")  # Use one team at a time to ensure QB is stacked with teammates
+stack_sizes <-NULL#3           # Number of players in stack
+num_lineups <- 10 #9           # Number of lineups to create 12 CIN, 5 DET, 6 KC, 5 MIA
+bans <- NULL#c("Teddy Bridgewater", "Joe Mixon", "Rashaad Penny")
+max_exposure <- 1
+
+
+
+### SlateProjections exported from NFL Matchups sheet PP Upside; import upside finder from PlayerProfiler (check cell A1 comment)
+
+SlateProjections <- read.csv("C:/Users/jorda/Downloads/DKImpliedProjectionsNFL.csv")
+DSTProjections <- read.csv("C:/Users/jorda/Downloads/DSTImpliedProjections.csv")
+
+
+SlateProjections <- SlateProjections %>%
+  merge(sd_fpts, all.x = TRUE) %>%
+  select(Name, FD.FPs, sd_fpts) %>%
+  rename(player = Name, Projected.Points = FD.FPs, SD = sd_fpts) %>%
+  mutate(Projected.Points = as.numeric(Projected.Points), SD = case_when(
+    player =="Deshaun Watson" ~ 7.5,
+    player =="Mike White" ~ 6,
+    is.na(SD) ~ 0.2,
+    T ~ SD
+  ))
+
+DSTProjections <- select(DSTProjections, DST, xfp) %>%
+  filter(xfp != "#N/A") %>%
+  rename(team = DST, fpts_proj = xfp) %>%
+  mutate(fpts_proj = as.numeric(fpts_proj), fpts_proj = fpts_proj*1.5)
+
+### Be sure to have downloaded salaries from DK to the below file location
+
+data <- read_fd("C:/Users/jorda/Downloads/FDSalariesNFL.csv") 
+
+bans <- data %>%
+  filter(player %in% bans) %>%
+  select(row_id)
+
+
+### Treating DST and QB data differently so they are addressed correctly for the purpose of stacking
+
+dst_data <- data %>%
+  filter(position == "D")
+
+### If you choose to stack, will set stacked team's and opponent's DSTs to -15 projected fps so they are not included in the lineup; not optimal since team DST could still score well in a blowout but this way the DST is not considered part of the stack with the QB and you are not playing a DST against your stack
+
+if(!is.null(teams_to_stack)){
+stacked_dst <- dst_data %>%
+ filter(team %in% teams_to_stack | opp_team %in% teams_to_stack) %>%
+  mutate(fpts_proj = -1000, SD = 0)
+
+unstacked_dst <- dst_data %>%
+  filter(!team %in% teams_to_stack & !opp_team %in% teams_to_stack)%>%
+  mutate(fpts_proj = .001*salary + .3*fpts_avg, SD = 2)
+
+dst_data <- rbind(stacked_dst, unstacked_dst)
+}else{
+    dst_data <-dst_data %>%
+      mutate(fpts_proj = .001*salary + .3*fpts_avg, SD = 2)
+}
+
+qb_data <- data %>%
+  filter(position == "QB") 
+
+qb_data <-qb_data %>%
+  merge(SlateProjections, by = "player") 
+
+qb_data <-qb_data %>%
+  select(-fpts_proj) %>%
+  rename(fpts_proj = Projected.Points)
+
+qb_data[is.na(qb_data)] <- 0
+
+if(!is.null(teams_to_stack)){
+stacked_qbs <- qb_data %>%
+  filter(team %in% teams_to_stack)
+
+### Assigning arbitrarily large fpts_proj and 0 SD to highest projected QB so that starter is in every lineup (i.e. so that if randomness were to set projection below 0 we don't start a backup); opposite for every other QB
+
+stacked_qbs <- stacked_qbs[order(stacked_qbs$fpts_proj),]
+stacked_qbs$fpts_proj[length(stacked_qbs$fpts_proj)] = 1000  
+stacked_qbs$SD[length(stacked_qbs$SD)] = 0  
+
+non_stacked_qbs <- qb_data %>%
+  filter(!team %in% teams_to_stack) %>%
+  mutate(fpts_proj = -1000, SD = 0)
+
+qb_data <- rbind(stacked_qbs, non_stacked_qbs)
+}
+
+data <- data %>%
+  filter(position != "D" & position != "QB") %>%
+  merge(SlateProjections, by = "player", all.x = TRUE) %>%
+  select(-fpts_proj) %>%
+  rename(fpts_proj = Projected.Points)
+  
+data <- data %>%
+  rbind(dst_data) %>%
+  rbind(qb_data)
+
+data[is.na(data)] <- 0
+data <- data[order(data$row_id),]
+for(i in 1:length(data$row_id)){
+  data$row_id[i] <- i
+}
+
+model <- model_fd_nfl(data)
+
+n <- nrow(data) 
+randomness <- function(x) rnorm(n, mean = data$fpts_proj, sd = data$SD)
+
+rm(results)
+results <- optimize_generic(data, model, L = num_lineups, randomness = randomness, stack_sizes = stack_sizes, stack_teams = teams_to_stack, max_exposure = max_exposure)#, bans = bans$row_id)
+write_lineups(results, "C:/Users/jorda/Downloads/FDlineupsNFL.csv", site = "fanduel", sport = "nfl")
+
+
+```
+
+### LP Solver Showdown FD
+```{r lp-solver-showdown-FD}
+
+### Would like to import actual SDs 
+
+## Parameters
+
+D1 <- "Cardinals"
+D2 <- "Patriots"
+D1proj <- 5.1
+D2proj <- 6.3
+D1sd <- D1proj/2
+D2sd <- D2proj/2
+num_lineups <- 150
+
+lineups <- data.frame(nrows = 5)
+export_to_dk <- data.frame(nrows = 5)
+salaries <- read_fd("C:/Users/jorda/Downloads/FDSalariesNFL.csv") 
+
+
+rep_str =  c("Philadelphia Eagles" = "Eagles", "Green Bay Packers" = "Packers", "Pittsburgh Steelers" = "Steelers", "Indianapolis Colts" = "Colts", "New England Patriots" = "Patriots", "Buffalo Bills" = "Bills", "Arizona Cardinals" = "Cardinals")
+salaries$player <- str_replace_all(salaries$player, rep_str)
+salaries <- rename(salaries, Name = player, TeamAbbrev = team)
+salaries$fpts_avg[is.na(salaries$fpts_avg)] <- 0
+
+SDOptimal <- read.csv("C:/Users/jorda/Downloads/DKImpliedProjectionsNFL.csv")
+
+SDOptimal <- SDOptimal %>%
+  mutate(proj = as.numeric(myprojFD))%>%
+  filter(!is.na(FD.Salary)) %>%
+  select(Name, proj) %>%
+  filter(!is.na(proj)) %>%
+  merge(salaries, all.y = TRUE) %>%
+  mutate(fpts_avg = case_when(is.na(fpts_avg) ~ 0, T ~ fpts_avg))%>%
+  mutate(sd = ((proj+fpts_avg)*.2+salary/1000-5)/4.5) %>%                                       #### replace with player SD (i.e. merge) once we get that added
+  distinct()
+
+SDOptimal$sd[SDOptimal$sd<0] <- 0
+
+rep_str =  c("AJ Dillon" = "A.J. Dillon", "Michael Pittman Jr." = "Michael Pittman")
+SDOptimal$Name <- str_replace_all(SDOptimal$Name, rep_str)
+SDOptimal <- mutate(SDOptimal, proj = case_when(Name == D1 ~ D1proj, Name == D2 ~ D2proj, T ~ proj), sd = case_when(Name == D1 ~ D1sd, Name == D2 ~ D2sd, T ~ sd))
+
+SDOptimal <- filter(SDOptimal, !is.na(proj), proj >= 1)
+
+j <- 1
+while(j <= num_lineups){
+
+cpt_list <- SDOptimal %>%
+  filter(position != "K" & position != "D")
+find_cpt <- as.numeric(rnorm(length(cpt_list$proj), cpt_list$proj, cpt_list$sd))
+find_cpt <- which.max(find_cpt)
+
+captain <- cpt_list$Name[find_cpt]
+
+sd_correlations <- correlation %>%
+  filter(full_name == captain)
+find_cpt <- SDOptimal %>%
+  filter(Name == captain)
+find_cpt <- find_cpt$position[1]
+
+if(find_cpt == "K" || find_cpt == "D"){
+  sd_correlations$qb_cor <- -0.3
+  sd_correlations$rb_cor <- 0.25
+  sd_correlations$rec_cor <- -0.2
+  sd_correlations$opp_qb_cor <- -0.4
+  sd_correlations$opp_rb_cor <- -0.65
+  sd_correlations$opp_rec_cor <- -0.1
+  sd_correlations$full_name <- captain
+  sd_correlations$player_id <- cpt_pos$player_id[1]
+  sd_correlations$position <- "K/DST"
+}
+
+cpt_pos <- SDOptimal %>%
+  filter(Name == captain) %>%
+  distinct()
+
+flex <- SDOptimal %>%
+  filter(Name != captain) %>%
+  rename(full_name = Name) %>%
+  filter(!is.na(proj))
+
+sd_correlations$TeamAbbrev <- cpt_pos$TeamAbbrev
+
+flex <- merge(flex, determine_position, all.x = TRUE) %>%
+  select(-player_id)
+
+flex[is.na(flex)] <- "K/DST"
+
+flex$corr_coef <- case_when(flex$position == "QB" & flex$TeamAbbrev == sd_correlations$TeamAbbrev[1] ~ sd_correlations$qb_cor[1],
+                            flex$position == "RB" & flex$TeamAbbrev == sd_correlations$TeamAbbrev[1] ~ sd_correlations$rb_cor[1],
+                            (flex$position == "WR" | flex$position == "TE") & flex$TeamAbbrev == sd_correlations$TeamAbbrev[1] ~ sd_correlations$rec_cor[1],
+                            flex$position == "QB" & flex$TeamAbbrev != sd_correlations$TeamAbbrev[1] ~ sd_correlations$opp_qb_cor[1],
+                            flex$position == "RB" & flex$TeamAbbrev != sd_correlations$TeamAbbrev[1] ~ sd_correlations$opp_rb_cor[1],
+                            (flex$position == "WR" | flex$position == "TE") & flex$TeamAbbrev != sd_correlations$TeamAbbrev[1] ~ sd_correlations$opp_rec_cor[1],
+                            T ~ 0)
+
+flex$proj <- flex$proj + flex$sd * flex$corr_coef / 2
+
+
+## Set coefficients of the decision variables
+objective.in <- rnorm(length(flex$proj), flex$proj, flex$sd)
+
+
+## Create constraint matrix
+matrix_vector <- flex$salary
+n <- length(matrix_vector)
+for(i in 1:n){
+  matrix_vector[n+i] <- 1
+}
+const.mat = matrix(matrix_vector, nrow = 2, byrow=TRUE)
+
+## Define constraints
+resource_constraint = 60000 - cpt_pos$salary[1]
+position_constraint = 4
+
+
+## RHS for the constraints
+const.rhs = c(resource_constraint, position_constraint)
+
+## Constraints direction
+const.dir = c("<=", "==")
+
+optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
+
+flex$optimal <- optimum$solution
+
+lineup <- filter(flex, optimal == 1) %>%
+  rename(Name = full_name)%>%
+  select(Name) %>%
+  mutate(pos = "FLEX")
+
+cpt_pos <- select(cpt_pos, Name) %>%
+  mutate(pos = "MVP")
+
+lineup <- rbind(cpt_pos, lineup) %>%
+  select(Name)
+
+if(j > 1){
+  lineups <- cbind(lineups, lineup)
+} else{
+  lineups <- lineup
+
+}
+
+lineups <- lineups[!duplicated(as.list(lineups))]
+
+j <- ncol(lineups)+1
+
+}
+
+# projections$player <- str_replace_all(projections$player, rep_str)
+
+
+lineups <- t(lineups)
+export_to_dk <- lineups
+
+
+for(k in 1:length(export_to_dk)){
+rep <- match(lineups[k], salaries$Name)
+rep <- salaries$player_id[rep]
+export_to_dk[k] <- rep
+}
+
+columns <- c("MVP", "F1", "F2", "F3", "F4")
+colnames(lineups) <- columns
+colnames(export_to_dk) <- columns
+
+
+ownership <- SDOptimal %>%
+  select(Name)
+
+ownership$CPT.Own <- 0
+ownership$FLEX.Own <- 0
+
+for(i in 1:length(ownership$Name)){
+  ownership$CPT.Own[i] = sum(lineups[,1] == ownership$Name[i])
+  ownership$FLEX.Own[i] = sum(lineups == ownership$Name[i])
+  
+}
+ownership$FLEX.Own <- (ownership$FLEX.Own - ownership$CPT.Own)/length(lineups[,1])*100
+ownership$CPT.Own <- ownership$CPT.Own/length(lineups[,1])*100
+
+export_to_dk <- lineups
+
+
+for(k in 1:length(export_to_dk)){
+rep <- match(lineups[k], SDOptimal$Name)
+rep <- SDOptimal$player_id[rep]
+export_to_dk[k] <- rep
+}
+write.csv(export_to_dk, "C:/Users/jorda/Downloads/FDEntriesNFL.csv", row.names = FALSE)
+
+```
+
+
+### Classic Lineup Builder LPSolve
+```{r classic-solver}
+
+numlineups <- 182
+teams_to_stack <-c("DAL", "BUF", "CIN", "SF")
+stack_size <- 3
+testing <- F
+locks <- NULL
+bans <- NULL
+use_myproj <- T
+against_opp_d <- 1 # max number of offensive players allowed against an opposing defense (stacks will never have an opposing defense)
+own_available <- F
+pb <- txtProgressBar(0, numlineups, style = 3)
+
+if(!testing){
+odata <- read_sheet("https://docs.google.com/spreadsheets/d/1CjCVMPLzgX1JONYas7GbXyV9ZEwWXPmDfH6pAgm-ZA8/edit#gid=537166457")
+ 
+  odata <- odata %>%
+   filter(!is.na(Name))
+
+}
+
+
+if(use_myproj){
+  odata <- odata %>%
+    mutate(DK.FPs = myproj)
+}
+
+teams <- odata$TeamAbbrev %>%
+  unique()
+
+times_stacked <- data.frame(team = teams, times_stacked = 0)
+t <- 0
+while(t < numlineups){
+  data <- odata
+  
+  #find stack
+  if(own_available){
+  stack_proj <- data %>%
+    group_by(TeamAbbrev) %>%
+    slice_max(order_by = DK.FPs, n = 3) %>%
+    summarise(sum_stack_fpts = sum(DK.FPs))
+  stack_qb_own <- data %>%
+    filter(Position == "QB") %>%
+    group_by(TeamAbbrev) %>% 
+    slice_max(order_by = OwnProj, n = 1) %>%
+    summarise(stack_qb_own = sum(OwnProj))
+  stack_own <- data %>%
+    group_by(TeamAbbrev) %>% 
+    slice_max(order_by = OwnProj, n = 3) %>%
+    summarise(stack_own = sum(OwnProj))
+  stacks <- merge(stack_proj, stack_qb_own) %>%
+    merge(stack_own)
+  stacks[2:4] <- as.data.frame(scale(stacks[2:4]))
+  
+  stacks$stack_appeal <- stacks$sum_stack_fpts + stacks$stack_qb_own*.33 + stacks$stack_own*.67
+  stacks$select <- rnorm(length(stacks$stack_appeal), stacks$stack_appeal, 1)
+
+  
+  picker_min <- min(stacks$select)
+  picker_max <- max(stacks$select)
+  pick <- runif(1, picker_min, picker_max)
+  
+  team_to_stack <- filter(stacks, select > pick)
+  team_to_stack <- team_to_stack$TeamAbbrev[which.min(team_to_stack$select)]
+  
+  }else{
+    team_to_stack <- "XYZ"
+    while(!team_to_stack %in% teams_to_stack){
+    team_to_stack <- data[sample(seq_len(nrow(data)), 1, prob=data$DK.FPs),]
+    team_to_stack <- team_to_stack$TeamAbbrev[1]
+    }
+  }
+  
+  stack_qb <- data %>%
+    filter(DK.FPs > 0, Position == "QB", TeamAbbrev == team_to_stack)
+  stack_rec <- data %>%
+    filter(Position == "WR" | Position == "TE", TeamAbbrev == team_to_stack)
+
+  top_rec_pick <- rnorm(length(stack_rec$DK.FPs), stack_rec$DK.FPs, stack_rec$sd_fpts)
+  
+  stack_rec <- stack_rec[which.max(top_rec_pick),]
+  
+  times_stacked <- mutate(times_stacked, times_stacked = case_when(team == team_to_stack ~ times_stacked + 1, T ~ times_stacked))
+
+  build_sd <- data %>%
+    select(Position, DK.FPs, sd_fpts)
+  
+  
+  ### Build optimizer
+  
+  objective.in <- rnorm(length(data$DK.FPs), mean = data$DK.FPs, sd = build_sd$sd_fpts)
+  
+  vsalary <- data$`DK Salary`
+  vstack_util <- as.numeric(data$TeamAbbrev == team_to_stack & !data$Position == "DST")
+  vlocks <- as.numeric(data$Name %in% stack_qb$Name | data$Name %in% stack_rec$Name | data$Name %in% locks)
+  vbans <- as.numeric((data$Opp %in% stack_qb$TeamAbbrev & data$Position == "DST") | data$Name %in% bans)
+  vqb <- as.numeric(data$Position == "QB")
+  vwr <- as.numeric(data$Position == "WR")
+  vrb <- as.numeric(data$Position == "RB")
+  vte <- as.numeric(data$Position == "TE")
+  vdst <- as.numeric(data$Position == "DST")
+  vplaying <- as.numeric(data$DK.FPs > 0)
+  vout  <- as.numeric(data$DK.FPs <= 0)
+  vteams <- c()
+  for(i in 1:length(teams)){
+    vteam <- as.numeric(data$TeamAbbrev == teams[i])
+    vopp_def <- as.numeric(data$Opp == teams[i] & data$Position == "DST")*(5-against_opp_d)
+    vteam <- vteam + vopp_def
+    vteams <-c(vteams, vteam)
+  }
+  
+  matrix_vector <- c(vsalary, vstack_util, vlocks, vbans, vqb, vwr, vrb, vte, vdst, vplaying, vout, vteams)
+  
+  const.mat = matrix(matrix_vector, nrow = length(matrix_vector)/length(data$`DK Salary`), byrow=TRUE)
+  const.dir = c("<=", ">=", "==", "==","==", ">=", ">=", ">=", "==", "==", "==")
+  const.rhs = c(50000, stack_size, sum(vlocks), 0, 1, 3, 2, 1, 1, 9, 0)
+  
+  for(i in 1:length(teams)){
+    const.dir = c(const.dir, "<=")
+    const.rhs = c(const.rhs, 5)
+  }
+  
+  optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
+
+  data$optimal <- optimum$solution
+  
+  lineup <- data %>%
+    filter(optimal == 1)
+if(nrow(lineup)==9){
+  qb <- filter(lineup, Position == "QB")
+  rb <- filter(lineup, Position == "RB")
+  wr <- filter(lineup, Position == "WR")
+  te <- filter(lineup, Position == "TE")
+  dst <- filter(lineup, Position == "DST")
+  
+  if(length(rb$Name) > 2){
+    flex <- rb[3,]
+    rb <- filter(rb, ! Name %in% flex$Name)
+  } else if(length(wr$Name) > 3){
+    flex <- wr[4,]
+    wr <- filter(wr, ! Name %in% flex$Name)
+
+  } else if(length(te$Name) > 1){
+    flex <- te[2,]        
+    te <- filter(te, ! Name %in% flex$Name)
+  }
+  
+  export_lineup <- c(qb$id, rb$id, wr$id, te$id, flex$id, dst$id)
+  
+  sum_fpts <- sum(objective.in[which(data$Name == qb$Name[1])], objective.in[which(data$Name == rb$Name[1])],objective.in[which(data$Name == rb$Name[2])], objective.in[which(data$Name == wr$Name[1])],objective.in[which(data$Name == wr$Name[2])],objective.in[which(data$Name == wr$Name[3])], objective.in[which(data$Name == te$Name[1])], objective.in[which(data$Name == flex$Name[1])], objective.in[which(data$Name == dst$Name[1])])
+  summary_lineup <- c(qb$Name, rb$Name, wr$Name, te$Name, flex$Name, dst$Name, sum_fpts)
+  
+  if(t == 0) {
+    summary_lineups <- summary_lineup
+    lineups <- export_lineup 
+    t <- 1
+    }else {
+      summary_lineups <- rbind(summary_lineups, summary_lineup)
+      summary_lineups <- unique(summary_lineups)
+      lineups <- rbind(lineups, export_lineup)
+      lineups <- unique(lineups)
+      t <- length(lineups[,1])
+    }
+}
+
+  setTxtProgressBar(pb, t)
+}
+close(pb)
+colnames(summary_lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST", "Projection")
+
+summary_lineups <- as.data.frame(summary_lineups)
+summary_lineups$Projection <- as.numeric(summary_lineups$Projection)
+summary_lineups <- summary_lineups[order(summary_lineups$Projection, decreasing = TRUE),]
+
+colnames(lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST")
+write.csv(lineups, "C:/Users/jorda/Downloads/DKLineupsNFL.csv", row.names = FALSE)
+
+```
+
+### Lineup Editor
+```{r dk-classic-lineup-editor}
+### Build lineups above, then use this to edit entries for direct upload
+plineups <- read.csv("C:/Users/jorda/Downloads/DKEntriesNFL.csv")
+plineups <- filter(plineups, !is.na(Entry.ID) & !is.na(as.numeric(Entry.ID))) %>%
+  select(Entry.ID, Contest.Name, Contest.ID, Entry.Fee)
+newlineups <- read.csv("C:/Users/jorda/Downloads/DKLineupsNFL.csv")
+newlineups <- cbind(plineups, newlineups)
+colnames(newlineups) <- c("Entry ID", "Contest Name", "Contest ID", "Entry Fee", "QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DST")
+write.csv(newlineups, "C:/Users/jorda/Downloads/DKEntriesNFL.csv", row.names = FALSE)
+```
+
+### FD classic Lineup Builder LPSolve
+```{r fd-classic-solver}
+
+numlineups <- 300
+teams_to_stack <-NULL
+stack_size <- 3
+testing <- F
+locks <- NULL
+bans <- NULL
+use_myproj <- T
+against_opp_d <- 1 # max number of offensive players allowed against an opposing defense (stacks will never have an opposing defense)
+
+
+if(!testing){
+odata <- read_sheet("https://docs.google.com/spreadsheets/d/1CjCVMPLzgX1JONYas7GbXyV9ZEwWXPmDfH6pAgm-ZA8/edit#gid=537166457")
+ 
+  odata <- odata %>%
+   filter(!is.na(Name))
+
+}
+
+teams <- data$TeamAbbrev %>%
+  unique()
+
+if(use_myproj){
+  odata <- odata %>%
+    mutate(FD.FPs = myprojFD)
+}
+
+times_stacked <- data.frame(team = teams, times_stacked = 0)
+t <- 0
+while(t < numlineups){
+  data <- odata
+  
+  
+  #find stack
+  
+  stack_proj <- data %>%
+    group_by(TeamAbbrev) %>%
+    slice_max(order_by = FD.FPs, n = 3) %>%
+    summarise(sum_stack_fpts = sum(FD.FPs))
+  stack_qb_own <- data %>%
+    filter(Position == "QB") %>%
+    group_by(TeamAbbrev) %>% 
+    slice_max(order_by = OwnProj, n = 1) %>%
+    summarise(stack_qb_own = sum(OwnProj))
+  stack_own <- data %>%
+    group_by(TeamAbbrev) %>% 
+    slice_max(order_by = OwnProj, n = 3) %>%
+    summarise(stack_own = sum(OwnProj))
+  stacks <- merge(stack_proj, stack_qb_own) %>%
+    merge(stack_own)
+  stacks[2:4] <- as.data.frame(scale(stacks[2:4]))
+  
+  stacks$stack_appeal <- stacks$sum_stack_fpts + stacks$stack_qb_own*.33 + stacks$stack_own*.67
+  stacks$select <- rnorm(length(stacks$stack_appeal), stacks$stack_appeal, 1)
+  
+  picker_min <- min(stacks$select)
+  picker_max <- max(stacks$select)
+  pick <- runif(1, picker_min, picker_max)
+  
+  team_to_stack <- filter(stacks, select > pick)
+  team_to_stack <- team_to_stack$TeamAbbrev[which.min(team_to_stack$select)]
+  
+  stack_qb <- data %>%
+    filter(FD.FPs > 0, Position == "QB", TeamAbbrev == team_to_stack)
+  stack_rec <- data %>%
+    filter(Position == "WR" | Position == "TE", TeamAbbrev == team_to_stack)
+  stack_rec_sd <- stack_rec %>%
+    select(Position, FD.FPs) %>%
+    mutate(sd = case_when(Position == "WR" ~ 2+.6 * FD.FPs, Position == "TE" ~ 1+.5*FD.FPs))
+  top_rec_pick <- rnorm(length(stack_rec$FD.FPs), stack_rec$FD.FPs, stack_rec_sd$sd)
+  
+  stack_rec <- stack_rec[which.max(top_rec_pick),]
+  
+  times_stacked <- mutate(times_stacked, times_stacked = case_when(team == team_to_stack ~ times_stacked + 1, T ~ times_stacked))
+
+  build_sd <- data %>%
+    select(Position, FD.FPs) %>%
+    mutate(sd = case_when(Position == "QB" ~ .3 * FD.FPs, Position == "RB" ~ .4 * FD.FPs, Position == "WR" ~ .45 * FD.FPs, Position == "TE" ~ .3*FD.FPs, Position == "DST" ~ .4*FD.FPs))
+  
+  
+  ### Build optimizer
+  
+  objective.in <- rnorm(length(data$FD.FPs), mean = data$FD.FPs, sd = build_sd$sd)
+  
+  vsalary <- data$`FD Salary`
+  vstack_util <- as.numeric(data$TeamAbbrev == team_to_stack & !data$Position == "DST")
+  vlocks <- as.numeric(data$Name %in% stack_qb$Name | data$Name %in% stack_rec$Name | data$Name %in% locks)
+  vbans <- as.numeric((data$Opp %in% stack_qb$TeamAbbrev & data$Position == "DST") | data$Name %in% bans)
+  vqb <- as.numeric(data$Position == "QB")
+  vwr <- as.numeric(data$Position == "WR")
+  vrb <- as.numeric(data$Position == "RB")
+  vte <- as.numeric(data$Position == "TE")
+  vdst <- as.numeric(data$Position == "DST")
+  vplaying <- as.numeric(data$FD.FPs > 0)
+  vout  <- as.numeric(data$FD.FPs <= 0)
+  vteams <- c()
+  for(i in 1:length(teams)){
+    vteam <- as.numeric(data$TeamAbbrev == teams[i])
+    vopp_def <- as.numeric(data$Opp == teams[i] & data$Position == "DST")*(4-against_opp_d)
+    vteam <- vteam + vopp_def
+    vteams <-c(vteams, vteam)
+  }
+
+  
+  matrix_vector <- c(vsalary, vstack_util, vlocks, vbans, vqb, vwr, vrb, vte, vdst, vplaying, vout, vteams)
+  
+  const.mat = matrix(matrix_vector, nrow = length(matrix_vector)/length(data$`FD Salary`), byrow=TRUE)
+  const.dir = c("<=", ">=", "==", "==","==", ">=", ">=", ">=", "==", "==", "==")
+  const.rhs = c(60000, stack_size, sum(vlocks), 0, 1, 3, 2, 1, 1, 9, 0)
+  
+  for(i in 1:length(teams)){
+    const.dir = c(const.dir, "<=")
+    const.rhs = c(const.rhs, 4)
+  }
+  
+  objective.in[is.nan(objective.in)] <- 0
+  objective.in[is.na(objective.in)] <- 0
+  objective.in[is.infinite(objective.in)] <- 0
+  
+  optimum =lp(direction = "max", objective.in, const.mat, const.dir, const.rhs, all.bin = TRUE)
+
+  data$optimal <- optimum$solution
+  
+  lineup <- data %>%
+    filter(optimal == 1)
+
+  qb <- filter(lineup, Position == "QB")
+  rb <- filter(lineup, Position == "RB")
+  wr <- filter(lineup, Position == "WR")
+  te <- filter(lineup, Position == "TE")
+  dst <- filter(lineup, Position == "DST")
+  
+  if(length(rb$Name) > 2){
+    flex <- rb[3,]
+    rb <- filter(rb, ! Name %in% flex$Name)
+  } else if(length(wr$Name) > 3){
+    flex <- wr[4,]
+    wr <- filter(wr, ! Name %in% flex$Name)
+
+  } else if(length(te$Name) > 1){
+    flex <- te[2,]        
+    te <- filter(te, ! Name %in% flex$Name)
+  }
+  
+  export_lineup <- c(qb$FDid, rb$FDid, wr$FDid, te$FDid, flex$FDid, dst$FDid)
+  
+  
+  sum_fpts <- sum(objective.in[which(data$Name == qb$Name[1])], objective.in[which(data$Name == rb$Name[1])],objective.in[which(data$Name == rb$Name[2])], objective.in[which(data$Name == wr$Name[1])],objective.in[which(data$Name == wr$Name[2])],objective.in[which(data$Name == wr$Name[3])], objective.in[which(data$Name == te$Name[1])], objective.in[which(data$Name == flex$Name[1])], objective.in[which(data$Name == dst$Name[1])])
+  summary_lineup <- c(qb$Name, rb$Name, wr$Name, te$Name, flex$Name, dst$Name, sum_fpts)
+  
+  
+  
+  if(t == 0) {
+    summary_lineups <- summary_lineup
+    lineups <- export_lineup 
+    t <- 1
+    }else {
+      summary_lineups <- rbind(summary_lineups, summary_lineup)
+      summary_lineups <- unique(summary_lineups)
+      lineups <- rbind(lineups, export_lineup)
+      lineups <- unique(lineups)
+      t <- length(lineups[,1])
+  }
+
+}
+colnames(summary_lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "D", "Projection")
+
+summary_lineups <- as.data.frame(summary_lineups)
+summary_lineups$Projection <- as.numeric(summary_lineups$Projection)
+summary_lineups <- summary_lineups[order(summary_lineups$Projection, decreasing = TRUE),]
+
+colnames(lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "D")
+write.csv(lineups, "C:/Users/jorda/Downloads/FDLineupsNFL.csv", row.names = FALSE)
+
+```
+
+
+### filter best lineups for upload
+```{r pick-lineups}
+
+
+num_to_upload <- 10
+
+best_lineups <- head(summary_lineups, n = num_to_upload)
+
+best_lineups <- best_lineups[,1:9]
+
+export_lineups <- best_lineups
+
+for(i in 1:num_to_upload){
+  for(j in 1:length(best_lineups)){
+    export_lineups[i, j] <- data$FDid[which(data$Name == best_lineups[i,j])]
+  }
+}
+
+colnames(export_lineups) <- c("QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF")
+
+write.csv(export_lineups, "C:/Users/jorda/Downloads/FDLineupsNFL.csv", row.names = FALSE)
+
 
 ```
