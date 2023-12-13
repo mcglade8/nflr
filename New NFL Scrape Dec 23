@@ -1,0 +1,391 @@
+---
+title: "NFL Scrape"
+output: html_document
+date: "2023-12-12"
+---
+
+```{r setup, include=FALSE}
+library(nflfastR)
+library(dplyr)
+library(tidyverse)
+library(nflreadr)
+library(ggplot2)
+```
+
+
+### scrape data
+```{r scrape}
+# nflfastr content
+pbp <- load_pbp(2022:2023)
+
+expected_points <- calculate_expected_points(pbp)
+weekly_player_stats <- calculate_player_stats(pbp, weekly = TRUE)
+kickers <- calculate_player_stats_kicking(pbp, weekly = TRUE)
+conversion_rates <- calculate_series_conversion_rates(pbp, weekly= TRUE)
+
+team_game_weeks <- weekly_player_stats %>%
+  select(recent_team, season, week) %>%
+  unique()
+
+team_game_weeks <- rename(team_game_weeks, posteam = recent_team)
+
+team_off_scr <- conversion_rates %>%
+  select(season, team, week, off_scr) %>%
+  rename(posteam = team)
+
+team_def_scr <- conversion_rates %>%
+  select(season, team, def_scr) %>%
+  rename(defteam = team) %>%
+  group_by(season, defteam) %>%
+  summarize(mean_def_scr = mean(def_scr))
+
+pbp <- decode_player_ids(pbp)
+pbp_with_expected_points <- merge(pbp, expected_points)
+pbp_with_expected_points$season <- 2022 + as.numeric(pbp_with_expected_points$game_date > "2023-06-01")
+pbp_with_expected_points <- merge(pbp_with_expected_points, team_off_scr, by= c("season", "week", "posteam")) %>%
+  merge(team_def_scr, by=c("season", "defteam"))
+
+# nflreadr content
+snaps <- load_snap_counts(seasons = 2022:2023)
+players <- load_players()
+injuries <- load_injuries(seasons = 2022:2023)
+injuries_out <- filter(injuries, report_status == "Out")
+
+snaps_simple <- select(snaps, season, week, player, offense_snaps)
+snaps_simple$player <- clean_player_names(snaps_simple$player)
+
+
+# create linear model for expected fantasy points for weekly_player_stats based solely on that game's usage - baseline
+weekly_player_stats <- as.data.frame(weekly_player_stats)
+weekly_player_stats <- rename(weekly_player_stats, posteam = recent_team, defteam = opponent_team)
+weekly_player_stats <- merge(weekly_player_stats, team_off_scr, by= c("season", "week", "posteam")) %>%
+  merge(team_def_scr, by=c("season", "defteam"))
+weekly_player_stats[is.na(weekly_player_stats)] <- 0
+weekly_player_stats$player_display_name <- clean_player_names(weekly_player_stats$player_display_name)
+weekly_player_stats <-rename(weekly_player_stats, player = player_display_name)
+weekly_player_stats <- merge(weekly_player_stats, snaps_simple)
+
+lm_expected_fps <- lm(fantasy_points_ppr ~ air_yards_share + attempts + passing_air_yards + passing_epa + dakota + carries + rushing_epa + targets + receiving_yards_after_catch + off_scr, data = weekly_player_stats)
+summary(lm_expected_fps)
+
+weekly_player_stats$expected_fantasy_points_ppr <- predict(lm_expected_fps, weekly_player_stats)
+weekly_player_stats$healthy <- 1
+
+# ggplot(data = weekly_player_stats, aes(x = expected_fantasy_points_ppr, y= fantasy_points_ppr)) +
+#   geom_point() + geom_smooth()
+
+weekly_player_stats_list <- convertToList(weekly_player_stats)
+weekly_player_stats_list_replace_out <- outToZeroes(weekly_player_stats_list)
+
+# At this point, weekly_player_stats_list_replace_out hierarchy is list > seasons > weeks > players
+
+player_fantasy_efficiency <- weekly_player_stats %>%
+  group_by(season, player) %>%
+  summarise(snaps_per_game = median(offense_snaps), exp_fp_per_snap = (sum(expected_fantasy_points_ppr)/sum(offense_snaps))) %>%
+  ungroup() %>%
+  mutate(exp_fp_per_game = snaps_per_game * exp_fp_per_snap)
+
+off_qb_snaps <- weekly_player_stats %>%
+  filter(position_group == "QB") %>%
+  select(season, posteam, week, offense_snaps) %>%
+  group_by(season, posteam, week) %>%
+  summarise(snaps = sum(offense_snaps)) %>%
+  ungroup() %>%
+  group_by(season, posteam) %>%
+  summarise(off_plays_per_week = mean(snaps)) %>%
+  rename(team = posteam, team_plays_per_week = off_plays_per_week)
+
+def_qb_snaps<- weekly_player_stats %>%
+  filter(position_group == "QB") %>%
+  select(season, defteam, week, offense_snaps) %>%
+  group_by(season, defteam, week) %>%
+  summarise(snaps = sum(offense_snaps)) %>%
+  ungroup() %>%
+  group_by(season, defteam) %>%
+  summarise(off_plays_per_week = mean(snaps)) %>%
+  rename(team = defteam, opp_plays_per_week = off_plays_per_week)
+
+pace_of_play <- merge(off_qb_snaps, def_qb_snaps)
+
+player_fantasy_efficiency_clean <- removeEfficiencyOutliers(player_fantasy_efficiency)
+
+weekly_missing_usage <- getMissingUsage(weekly_player_stats_list_replace_out, player_fantasy_efficiency_clean, team_game_weeks)
+
+combined_data <- addUsage(weekly_player_stats_list_replace_out, weekly_missing_usage)
+
+flattened_data <- flattenData(combined_data)
+
+clean_flattened_data <- flattened_data %>%
+  filter(! player == "0")
+
+clean_flattened_data <- merge(clean_flattened_data, player_fantasy_efficiency_clean)
+
+off_pop <- select(pace_of_play, -opp_plays_per_week) %>%
+  rename(posteam = team)
+
+def_pop <- select(pace_of_play, -team_plays_per_week) %>%
+  rename(defteam = team)
+
+clean_flattened_data_with_pop <- merge(clean_flattened_data, off_pop) %>%
+  merge(def_pop) %>%
+  mutate(position_snaps_missing = case_when(
+    position_group == "RB" ~ team_run_snaps_missing,
+    position_group %in% c("WR", "TE") ~ team_rec_snaps_missing,
+    TRUE ~ 0
+  ), position_eff_missing = case_when(
+    position_group == "RB" ~ team_run_eff_missing + 0.2*team_rec_eff_missing,
+    position_group %in% c("WR", "TE") ~ team_rec_eff_missing + 0.2*team_run_eff_missing,
+    TRUE ~ 0
+  ))
+
+training_data <- select(clean_flattened_data_with_pop, season, week, player, posteam, defteam, position_group, expected_fantasy_points_ppr, fantasy_points_ppr, team_run_snaps_missing, team_run_eff_missing, team_rec_snaps_missing, team_rec_eff_missing, back_3_weeks_exp_fp, back_2_weeks_exp_fp, back_1_weeks_exp_fp, back_3_weeks_dif_fp, back_2_weeks_dif_fp, back_1_weeks_dif_fp, snaps_per_game, exp_fp_per_snap, exp_fp_per_game, team_plays_per_week, opp_plays_per_week, position_snaps_missing, position_eff_missing)
+
+training_data <- preprocess(training_data)
+
+# going to pass this to python and see if we can do anything with that
+write.csv(training_data, "C:/Users/jorda/Downloads/model_training_data.csv")
+
+# lm_predict_expected_fantasy_points <- lm(expected_fantasy_points_ppr ~ snaps_per_game + exp_fp_per_snap + position_eff_missing  +  opp_plays_per_week + back_2_weeks_exp_fp+ back_1_weeks_exp_fp, data = clean_flattened_data_with_pop)
+# summary(lm_predict_expected_fantasy_points)
+# 
+# lm_predict_actual_fantasy_points <- lm(fantasy_points_ppr ~ snaps_per_game + exp_fp_per_snap+ position_eff_missing + team_run_eff_missing + opp_plays_per_week + back_3_weeks_exp_fp + back_2_weeks_exp_fp + back_1_weeks_exp_fp + back_1_weeks_dif_fp, data = clean_flattened_data_with_pop)
+# summary(lm_predict_actual_fantasy_points)
+# 
+# clean_flattened_data_with_pop <- mutate(clean_flattened_data_with_pop, proj_exp_fp = predict(lm_predict_expected_fantasy_points, clean_flattened_data_with_pop), proj_act_fp = predict(lm_predict_actual_fantasy_points, clean_flattened_data_with_pop))
+# 
+# clean_flattened_data_with_pop$difference_from_projected <- clean_flattened_data_with_pop$expected_fantasy_points_ppr - clean_flattened_data_with_pop$proj_exp_fp
+# 
+# clean_flattened_data_with_pop <- clean_flattened_data_with_pop[order(clean_flattened_data_with_pop$difference_from_projected, decreasing = TRUE),]
+# 
+# ggplot(data=clean_flattened_data_with_pop, aes(x=proj_exp_fp, y=expected_fantasy_points_ppr), color="blue") + geom_point()
+```
+
+### Post python
+```{r post-python}
+python_projections <- read.csv("C:/Users/jorda/Downloads/predictions.csv")
+actual_data <- clean_flattened_data_with_pop %>%
+  select(season, player, week, posteam, defteam, fantasy_points_ppr) %>%
+  merge(python_projections)
+
+ggplot(actual_data, aes(x=X0, y=fantasy_points_ppr))+geom_point()
+
+```
+
+### functions
+```{r functions}
+
+preprocess <- function(df){
+  for(c in 1:ncol(df)){
+    if(is.numeric(df[,c]) & !colnames(df)[c] %in% c("season", "week")){
+      this_max <- max(df[,c])
+      df[,c] <- df[,c]/max(df[,c])
+      if(colnames(df)[c]== "fantasy_points_ppr"){
+        cat("Convert back to projection: Multiply by ", this_max)
+      }
+    }
+  }
+  return(df)
+}
+
+flattenData <- function(l){
+  #l <- combined_data
+  df <- data.frame()
+  for(s in 1:length(l)){
+    #s <- 1
+    szn <- l[[s]]
+    for(w in 1:length(szn)){
+      #w <- 2
+      wk <- szn[[w]]
+      for(p in 1:length(wk)){
+        tryCatch({
+          player_df <- as.data.frame(wk[[p]])
+          
+          df <- rbind(df, player_df)
+
+        }, error = function(e) {cat(paste("skip: ", names(l)[s], names(szn)[w], names(wk)[p], sep = " "))})
+      }
+    }
+  }
+  return(df)
+}
+
+addUsage <- function(l, usg){
+  #l <- weekly_player_stats_list
+  for(s in 1:length(l)){
+    #s <- 1
+    szn <- l[[s]]
+    for(w in 1:length(szn)){
+      #w <- 2
+      wk <- szn[[w]]
+      for(p in 1:length(wk)){
+        # get the missing usage for the team for offensive positions
+        usg_index <- intersect(intersect(which(usg$season == names(l)[s]) , which(usg$week == w)), which(usg$posteam == player[["posteam"]]))
+        l[[s]][[w]][[p]][["team_run_snaps_missing"]] <- usg$run_snaps[usg_index]
+        l[[s]][[w]][[p]][["team_run_eff_missing"]] <- usg$run_eff[usg_index]
+        l[[s]][[w]][[p]][["team_rec_snaps_missing"]] <- usg$rec_snaps[usg_index]
+        l[[s]][[w]][[p]][["team_rec_eff_missing"]] <- usg$rec_eff[usg_index]
+        
+        if(w < 4){
+          b3e <- 0
+          b3d <- 0
+        }else {
+          b3e <- l[[s]][[w-3]][[p]][["expected_fantasy_points_ppr"]]
+          b3d <- l[[s]][[w-3]][[p]][["fantasy_points_ppr"]] - b3e 
+        }
+        if(w < 3){
+          b2e <- 0
+          b2d <- 0
+        }else {
+          b2e <- l[[s]][[w-2]][[p]][["expected_fantasy_points_ppr"]]
+          b2d <- l[[s]][[w-2]][[p]][["fantasy_points_ppr"]] - b2e 
+        }
+        if(w < 2){
+          b1e <- 0
+          b1d <- 0
+        }else {
+          b1e <- l[[s]][[w-1]][[p]][["expected_fantasy_points_ppr"]]
+          b1d <- l[[s]][[w-1]][[p]][["fantasy_points_ppr"]] - b1e 
+        }
+        # get last 3 weeks expected fantasy points and the differential between actual and expected
+        l[[s]][[w]][[p]][["back_3_weeks_exp_fp"]] <- b3e
+        l[[s]][[w]][[p]][["back_3_weeks_dif_fp"]] <- b3d
+        l[[s]][[w]][[p]][["back_2_weeks_exp_fp"]] <- b2e
+        l[[s]][[w]][[p]][["back_2_weeks_dif_fp"]] <- b2d
+        l[[s]][[w]][[p]][["back_1_weeks_exp_fp"]] <- b1e
+        l[[s]][[w]][[p]][["back_1_weeks_dif_fp"]] <- b1d
+      }
+    }
+  }
+  return(l)
+}
+
+convertToList <- function(df){
+  szns <- unique(df$season)
+  base_list <- list()
+  for(s in 1:length(szns)){
+    szn_list <- list()
+    this_df <- filter(df, season == szns[s])
+    szn_players <- unique(this_df$player)
+    max_week <- max(this_df$week)
+    for(w in 1:max_week){
+      this_week <- list()
+      this_week_df <- filter(this_df, week == w)
+      for(p in 1:length(szn_players)){
+        if(szn_players[p] %in% this_week_df$player){
+          p_list <- list()
+          pw_df <- filter(this_week_df, player == szn_players[p])
+          cn <- colnames(this_week_df)
+          for(col in 1:length(cn)){
+            p_list[cn[col]] <- pw_df[1,col]
+          }
+          this_week[[szn_players[p]]] <- p_list
+        }else{
+          this_week[[szn_players[p]]] <- "Out"
+        }
+      }
+      szn_list[[w]] <- this_week
+    }
+    base_list[[as.character(szns[s])]] <- szn_list
+  }
+  return(base_list)
+}
+
+outToZeroes <- function(l){
+  #l <- weekly_player_stats_list
+  for(s in 1:length(l)){
+    #s <- 1
+    szn <- l[[s]]
+    for(w in 1:length(szn)){
+      #w <- 2
+      wk <- szn[[w]]
+      for(p in 1:length(wk)){
+        #p <- 9
+        if(!is.list(wk[[p]])){
+          found <- F
+          i <- w-1
+          while(!found && i > 0){
+            if(!is.list(szn[[i]][[p]])){ 
+              i <- i-1
+            }else{
+              szn[[w]][[p]] <- szn[[i]][[p]]
+              for(cn in 1:length(names(szn[[w]][[p]]))){
+                if(is.numeric(szn[[w]][[p]][[cn]]) && !names(szn[[w]][[p]])[cn] %in% c('season', 'week')){
+                  szn[[w]][[p]][[cn]] <- 0
+                }
+                if(names(szn[[w]][[p]])[cn] == "defteam") szn[[w]][[p]][[cn]] <- "OUT"
+              }
+              found <- T
+            }
+          }
+          if(!found) i <- w+1
+          while(!found && i <= length(szn)){
+            if(!is.list(szn[[i]][[p]])){ 
+              i <- i+1 
+            }else{
+              szn[[w]][[p]] <- szn[[i]][[p]]
+              for(cn in 1:length(names(szn[[w]][[p]]))){
+                if(is.numeric(szn[[w]][[p]][[cn]]) && !names(szn[[w]][[p]])[cn] %in% c('season', 'week')){
+                  szn[[w]][[p]][[cn]] <- 0
+                }
+                if(names(szn[[w]][[p]])[cn] == "defteam") szn[[w]][[p]][[cn]] <- "OUT"
+              }
+              found <- T
+            }
+          }
+        }
+      }
+      l[[s]] <- szn
+    }
+  }
+  return(l)
+}
+
+expOffenseSnaps <- function(oTeam, dTeam, season, pace){
+  a <- filter(pace, team == oTeam & season == season)$team_plays_per_week[1]
+  b <- filter(pace, team == dTeam & season == season)$opp_plays_per_week[1]
+  
+  return((a+b)/2)
+}
+
+getMissingUsage <- function(l, eff, tm_g){
+  #tm_g <- team_game_weeks
+  #eff <- player_fantasy_efficiency
+  tm_g$run_snaps <- 0
+  tm_g$run_eff <- 0
+  tm_g$rec_snaps <-0
+  tm_g$rec_eff <- 0
+  #l <- weekly_player_stats_list_replace_out
+  for(s in 1:length(l)){
+   # s <- 1
+    szn <- l[[s]]
+    for(w in 1:length(szn)){
+     # w <- 2
+      wk <- szn[[w]]
+      for(p in 1:length(wk)){
+        player <- wk[[p]]
+        #p <- 9
+        if(player[["defteam"]] == "OUT"){
+          name <- names(wk)[p]
+          team_index <- intersect(intersect(which(tm_g$season == names(l)[s]) , which(tm_g$week == w)), which(tm_g$posteam == player[["posteam"]]))
+          eff_index <- intersect(which(eff$player == name), which(eff$season == names(l)[s]))
+          if(player[["position_group"]] == "RB"){
+            tm_g$run_snaps[team_index] <- tm_g$run_snaps[team_index]+eff$snaps_per_game[eff_index]
+            tm_g$run_eff[team_index] <- tm_g$run_eff[team_index]+eff$exp_fp_per_snap[eff_index]
+          } else if(player[["position_group"]] %in% c("WR", "TE")){
+            tm_g$rec_snaps[team_index] <- tm_g$rec_snaps[team_index]+eff$snaps_per_game[eff_index]
+            tm_g$rec_eff[team_index] <- tm_g$rec_eff[team_index]+eff$exp_fp_per_snap[eff_index]
+          }
+        }
+      }
+    }
+  }
+  return(tm_g)
+}
+
+removeEfficiencyOutliers <- function(eff){
+  eff$snaps_per_game[which(eff$snaps_per_game < 7)] <- 0
+  eff$exp_fp_per_snap[which(eff$snaps_per_game < 7)] <- 0
+  eff$exp_fp_per_game[which(eff$snaps_per_game < 7)] <- 0
+  return(eff)
+}
+```
